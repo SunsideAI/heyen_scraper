@@ -202,20 +202,20 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 # EXTRACTION FUNCTIONS
 # ===========================================================================
 
-def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    """Extrahiere Preis"""
-    # Suche nach Preis-Pattern in den Eckdaten
-    # Verschiedene Formate: "Kaufpreis: 459.500 €" oder "- Kaufpreis: 459.500 €"
+def extract_price(page_text: str) -> str:
+    """Extrahiere Preis aus dem Seitentext"""
+    # Suche nach verschiedenen Preis-Patterns
     patterns = [
-        # Mit Doppelpunkt
-        r"[-•]?\s*Kaufpreis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
-        r"[-•]?\s*Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
-        r"[-•]?\s*Warmmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
-        r"[-•]?\s*Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
-        r"[-•]?\s*Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
-        # Ohne Doppelpunkt aber mit Leerzeichen
-        r"Kaufpreis\s+([\d.]+(?:,\d+)?)\s*€",
-        r"Kaltmiete\s+([\d.]+(?:,\d+)?)\s*€",
+        # Standard: "Kaufpreis: 459.500 €"
+        r"[-•]?\s*Kaufpreis(?:vorstellung)?[:\s]+(?:der\s+Eigentümer[:\s]+)?€?\s*([\d.]+(?:,\d+)?)\s*€",
+        # Kaltmiete
+        r"[-•]?\s*Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        # Warmmiete
+        r"[-•]?\s*Warmmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        # Generische Miete
+        r"[-•]?\s*Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        # Generischer Preis
+        r"[-•]?\s*Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
     ]
     
     for pattern in patterns:
@@ -390,6 +390,13 @@ def collect_detail_links() -> List[str]:
     """Sammle alle Detailseiten-Links von allen Angebotsseiten"""
     all_links = []
     
+    # URLs die keine echten Immobilien sind
+    BLACKLIST = [
+        "/finanzierung/",
+        "/diskrete-kaufangebote/",
+        "/diskrete-mietangebote/",
+    ]
+    
     for list_url in LIST_URLS:
         print(f"[LIST] Hole {list_url}")
         try:
@@ -399,9 +406,15 @@ def collect_detail_links() -> List[str]:
             # Format: /kaufangebote/[slug]/ oder /mietangebote/[slug]/
             for a in soup.find_all("a", href=True):
                 href = a["href"]
+                
+                # Prüfe ob es ein Immobilien-Link ist
                 if ("/kaufangebote/" in href or "/mietangebote/" in href) and href.count("/") >= 3:
                     # Ignoriere die Hauptseiten
                     if href.strip("/") in ["kaufangebote", "mietangebote"]:
+                        continue
+                    
+                    # Ignoriere Blacklist-URLs
+                    if any(blacklisted in href for blacklisted in BLACKLIST):
                         continue
                     
                     full_url = urljoin(BASE, href)
@@ -423,21 +436,39 @@ def parse_detail(detail_url: str) -> dict:
     title = ""
     for tag in soup.find_all(["h1", "h2"]):
         text = _norm(tag.get_text(strip=True))
-        if text and len(text) > 10 and "Kaufangebot" not in text:
+        # Ignoriere generische Titel
+        if text and len(text) > 10 and text not in ["Aktuelles Kaufangebot", "Aktuelles Mietangebot"]:
             title = text
             break
     
-    # Fallback: Suche nach Muster "Wohnhaus in..."
-    if not title:
-        m = re.search(r"(Wohnhaus|Eigentumswohnung|Baugrundstück|Wohnanlage)\s+in\s+[A-Z][\w\s/-]+", page_text)
-        if m:
-            title = m.group(0)
+    # Fallback 1: Nächstes H2 nach generischem H1
+    if not title or title in ["Aktuelles Kaufangebot", "Aktuelles Mietangebot"]:
+        h_tags = soup.find_all(["h1", "h2", "h3"])
+        for i, tag in enumerate(h_tags):
+            text = _norm(tag.get_text(strip=True))
+            if text in ["Aktuelles Kaufangebot", "Aktuelles Mietangebot"] and i + 1 < len(h_tags):
+                next_text = _norm(h_tags[i + 1].get_text(strip=True))
+                if next_text and len(next_text) > 10:
+                    title = next_text
+                    break
+    
+    # Fallback 2: Suche nach Muster "Wohnhaus in..." im Text
+    if not title or len(title) < 10:
+        patterns = [
+            r"((?:Wohnhaus|Eigentumswohnung|Baugrundstück|Wohnanlage|Apartment|Maisonette-Wohnung)\s+in\s+[A-Z][\w\s/-]+)",
+            r"((?:Stilvolle|Charmante|Luxuriös|Modern)\s+\d+-Zimmer-Wohnung\s+in\s+[A-Z][\w\s/-]+)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, page_text)
+            if m:
+                title = m.group(1).strip()
+                break
     
     # Objektnummer aus URL
     objektnummer = extract_objektnummer(detail_url)
     
     # Preis
-    preis = extract_price(soup, page_text)
+    preis = extract_price(page_text)
     
     # PLZ/Ort
     ort = extract_plz_ort(page_text, title)
