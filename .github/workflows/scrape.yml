@@ -2,8 +2,8 @@ name: Scrape Heyen Immobilien
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Täglich um 6 Uhr
-  workflow_dispatch:      # Manueller Trigger
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -17,11 +17,16 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install dependencies
+      - name: Install Chrome
         run: |
-          pip install requests beautifulsoup4 lxml
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
       
-      - name: Run Heyen scraper
+      - name: Install Python dependencies
+        run: |
+          pip install selenium requests beautifulsoup4 lxml
+      
+      - name: Run scraper
         env:
           AIRTABLE_TOKEN: ${{ secrets.HEYEN_AIRTABLE_TOKEN }}
           AIRTABLE_BASE: ${{ secrets.HEYEN_AIRTABLE_BASE }}
