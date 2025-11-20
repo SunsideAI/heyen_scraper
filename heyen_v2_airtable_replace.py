@@ -153,8 +153,12 @@ def airtable_existing_fields() -> set:
     """Ermittle existierende Felder"""
     _, all_fields = airtable_list_all()
     if not all_fields:
+        print("[DEBUG] No existing records in Airtable to determine fields")
         return set()
-    return set(all_fields[0].keys())
+    
+    fields = set(all_fields[0].keys())
+    print(f"[DEBUG] Existing Airtable fields: {fields}")
+    return fields
 
 def airtable_batch_create(records: List[dict]):
     """Erstelle Records in Batches"""
@@ -194,9 +198,27 @@ def airtable_batch_delete(record_ids: List[str]):
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
     """Bereinige Record für Airtable"""
+    print(f"[DEBUG] sanitize_record_for_airtable called")
+    print(f"[DEBUG]   Allowed fields: {allowed_fields if allowed_fields else 'NONE (will accept all)'}")
+    print(f"[DEBUG]   Record keys: {list(record.keys())}")
+    print(f"[DEBUG]   Record Preis value: {record.get('Preis', 'NOT IN RECORD')}")
+    
+    # Wenn keine allowed_fields gesetzt sind (z.B. erste Records), akzeptiere alles
     if not allowed_fields:
+        print(f"[DEBUG]   -> Returning full record (no field restrictions)")
         return record
-    return {k: v for k, v in record.items() if k in allowed_fields or not allowed_fields}
+    
+    sanitized = {k: v for k, v in record.items() if k in allowed_fields}
+    print(f"[DEBUG]   -> Sanitized keys: {list(sanitized.keys())}")
+    print(f"[DEBUG]   -> Sanitized Preis: {sanitized.get('Preis', 'REMOVED!')}")
+    
+    # Check if Preis field was removed
+    if "Preis" in record and "Preis" not in sanitized:
+        print(f"[DEBUG]   !!! WARNING: 'Preis' field was REMOVED during sanitization!")
+        print(f"[DEBUG]   !!! This means the Airtable table does not have a field named 'Preis'")
+        print(f"[DEBUG]   !!! Please check your Airtable field names (case-sensitive!)")
+    
+    return sanitized
 
 # ===========================================================================
 # EXTRACTION FUNCTIONS
@@ -496,15 +518,30 @@ def parse_detail(detail_url: str) -> dict:
     # PLZ/Ort
     ort = extract_plz_ort(page_text, title)
     
-    # Bild-URL - erstes größeres Bild
+    # Bild-URL - erstes größeres Bild (nicht das Logo)
     image_url = ""
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if src and ("/wp-content/uploads/" in src or "go-x" in src):
-            # Ignoriere kleine Icons
-            if "logo" not in src.lower() and "icon" not in src.lower():
-                image_url = src if src.startswith("http") else urljoin(BASE, src)
-                break
+            # Ignoriere kleine Icons und Logos
+            if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                continue
+            
+            # Ignoriere das Standard-Platzhalterbild
+            if "2b42354c-5e2d-4fab-acae-4280e6ed4089" in src:
+                continue
+            
+            # Prüfe Bildgröße anhand URL oder alt-Text
+            alt = img.get("alt", "").lower()
+            if "logo" in alt:
+                continue
+            
+            image_url = src if src.startswith("http") else urljoin(BASE, src)
+            print(f"[DEBUG] Found image: {image_url[:80]}...")
+            break
+    
+    if not image_url:
+        print(f"[DEBUG] No suitable image found for {detail_url}")
     
     # Kategorie
     kategorie = extract_kategorie(page_text, title, detail_url)
@@ -616,12 +653,15 @@ def run():
         
         desired = {}
         for r in all_rows:
+            print(f"[DEBUG] Processing record for Airtable: Titel={r.get('Titel', 'N/A')[:30]}, Preis={r.get('Preis', 'N/A')}")
             k = unique_key(r)
             if k in desired:
                 if len(r.get("Beschreibung", "")) > len(desired[k].get("Beschreibung", "")):
                     desired[k] = sanitize_record_for_airtable(r, allowed)
             else:
-                desired[k] = sanitize_record_for_airtable(r, allowed)
+                sanitized = sanitize_record_for_airtable(r, allowed)
+                print(f"[DEBUG] After sanitization, Preis={sanitized.get('Preis', 'MISSING')}")
+                desired[k] = sanitized
         
         to_create, to_update, keep = [], [], set()
         for k, fields in desired.items():
