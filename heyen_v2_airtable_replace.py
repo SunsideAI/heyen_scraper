@@ -200,18 +200,21 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     """Extrahiere Preis"""
-    # Suche nach Preis-Pattern
+    # Suche nach Preis-Pattern in den Eckdaten
+    # Format: "Kaufpreis: 459.500 €" oder "Kaltmiete: 1.250 €"
     for pattern in [
-        r"Kaufpreis[:\s]+€?\s*([\d.,]+)\s*€?",
-        r"Kaltmiete[:\s]+€?\s*([\d.,]+)\s*€?",
-        r"Miete[:\s]+€?\s*([\d.,]+)\s*€?",
-        r"Preis[:\s]+€?\s*([\d.,]+)\s*€?"
+        r"Kaufpreis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        r"Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        r"Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
+        r"Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€"
     ]:
         m = re.search(pattern, page_text, re.IGNORECASE)
         if m:
-            preis_str = m.group(1).replace(".", "").replace(",", ".")
+            preis_str = m.group(1)
+            # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
+            preis_clean = preis_str.replace(".", "").replace(",", ".")
             try:
-                preis_num = float(preis_str)
+                preis_num = float(preis_clean)
                 if preis_num > 100:  # Plausibilitätsprüfung
                     return f"€{int(preis_num):,}".replace(",", ".")
             except:
@@ -220,12 +223,15 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     return ""
 
 def parse_price_to_number(preis_str: str) -> Optional[float]:
-    """Konvertiere Preis-String zu Nummer"""
+    """Konvertiere Preis-String zu Nummer für Airtable"""
     if not preis_str:
         return None
     
-    # Entferne alles außer Zahlen, Punkt und Komma
-    clean = re.sub(r"[^0-9.,]", "", preis_str)
+    # Entferne Euro-Symbol und Whitespace
+    clean = preis_str.replace("€", "").strip()
+    
+    # Deutsche Zahlenformate: 459.500 € oder 1.250,50 €
+    # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
     clean = clean.replace(".", "").replace(",", ".")
     
     try:
@@ -327,15 +333,24 @@ def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
     
     return ""
 
-def extract_kategorie(page_text: str, title: str) -> str:
+def extract_kategorie(page_text: str, title: str, url: str) -> str:
     """Bestimme Kategorie (Kaufen/Mieten)"""
-    text = (title + " " + page_text).lower()
+    # Wenn URL /kaufangebote/ enthält, ist es definitiv Kaufen
+    if "/kaufangebote/" in url:
+        return "Kaufen"
     
-    # Prüfe auf Miet-Keywords
-    if any(keyword in text for keyword in ["miete", "vermieten", "zur miete", "mietangebote"]):
+    # Wenn URL /mietangebote/ enthält, ist es definitiv Mieten
+    if "/mietangebote/" in url:
         return "Mieten"
     
-    # Default: Kaufen (da URL /kaufangebote/)
+    # Fallback: Textanalyse
+    text = (title + " " + page_text).lower()
+    
+    # Prüfe auf explizite Miet-Keywords
+    if any(keyword in text for keyword in ["zur miete", "zu vermieten", "mietangebot", "miete monatlich"]):
+        return "Mieten"
+    
+    # Default: Kaufen
     return "Kaufen"
 
 def extract_objekttyp(page_text: str, title: str) -> str:
@@ -422,7 +437,7 @@ def parse_detail(detail_url: str) -> dict:
                 break
     
     # Kategorie
-    kategorie = extract_kategorie(page_text, title)
+    kategorie = extract_kategorie(page_text, title, detail_url)
     
     # Objekttyp
     objekttyp = extract_objekttyp(page_text, title)
