@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-HEYEN Immobilien Scraper v3.0 - SELENIUM VERSION
-Für: https://www.heyen-immobilien.de/kaufangebote/
-     https://www.heyen-immobilien.de/mietangebote/
+Scraper für https://www.heyen-immobilien.de/kaufangebote/
+Extrahiert Immobilienangebote und synct mit Airtable
 
-WARUM SELENIUM:
-Die Website lädt Inhalte dynamisch per JavaScript/WordPress Page Builder
-BeautifulSoup sieht nur unvollständiges HTML
-
-INSTALLATION:
-pip install selenium requests beautifulsoup4 lxml
-sudo apt-get install chromium-browser chromium-chromedriver
+Basierend auf streil-immo Scraper v1.7
 """
 
 import os
@@ -23,112 +16,113 @@ from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Optional
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-except ImportError:
-    print("[ERROR] Selenium nicht installiert: pip install selenium")
-    sys.exit(1)
-
-try:
-    from bs4 import BeautifulSoup
     import requests
+    from bs4 import BeautifulSoup
 except ImportError:
-    print("[ERROR] Module fehlen: pip install requests beautifulsoup4 lxml")
+    print("[ERROR] Fehlende Module. Bitte installieren:")
+    print("  pip install requests beautifulsoup4 lxml")
     sys.exit(1)
 
 # ===========================================================================
 # KONFIGURATION
 # ===========================================================================
 
-BASE_URL = "https://www.heyen-immobilien.de"
-KAUFANGEBOTE_URL = f"{BASE_URL}/kaufangebote/"
-MIETANGEBOTE_URL = f"{BASE_URL}/mietangebote/"
+BASE = "https://www.heyen-immobilien.de"
+LIST_URL = f"{BASE}/kaufangebote/"
 
 # Airtable
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
-PAGE_LOAD_WAIT = 5
+# Rate Limiting
+REQUEST_DELAY = 1.5
 
 # ===========================================================================
-# SELENIUM SETUP
+# REGEX PATTERNS
 # ===========================================================================
 
-def create_driver():
-    """Erstelle Selenium WebDriver"""
-    print("[SELENIUM] Initialisiere Chrome WebDriver...")
-    
-    chrome_options = Options()
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
-    chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-    
-    try:
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(30)
-        print("  ✓ Chrome WebDriver bereit\n")
-        return driver
-    except Exception as e:
-        print(f"  ✗ Fehler: {e}")
-        print("\n[HINT] Chrome/Chromium installieren:")
-        print("  sudo apt-get install chromium-browser chromium-chromedriver")
-        sys.exit(1)
+RE_PLZ_ORT = re.compile(r"\b(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-\s/]+)")
+RE_PRICE = re.compile(r"([\d.,]+)\s*€")
+
+# ===========================================================================
+# STOPWORDS
+# ===========================================================================
+
+STOP_STRINGS = [
+    "Cookie", "Datenschutz", "Impressum", "Sie haben Fragen",
+    "kontakt@", "Tel:", "Fax:", "E-Mail:", "www.", "http",
+    "© ", "JavaScript", "Alle Rechte", "Rufen Sie uns an",
+    "Kontaktieren Sie mich", "RICHARD HEYEN", "Telefon:",
+    "Mobil:", "Anschrift:"
+]
 
 # ===========================================================================
 # HELPER FUNCTIONS
 # ===========================================================================
 
 def _norm(s: str) -> str:
+    """Normalisiere String"""
     if not s:
         return ""
-    return re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def is_valid_property_url(url: str) -> bool:
-    """Prüft ob URL eine echte Immobilien-Detailseite ist"""
-    parsed = urlparse(url)
+def _clean_desc_lines(lines: List[str]) -> List[str]:
+    """Bereinige Beschreibungszeilen"""
+    cleaned = []
+    seen = set()
     
-    if parsed.netloc not in ["www.heyen-immobilien.de", "heyen-immobilien.de"]:
-        return False
+    for line in lines:
+        line = _norm(line)
+        if not line or len(line) < 10:
+            continue
+        
+        # Filtere Stopwords
+        if any(stop in line for stop in STOP_STRINGS):
+            continue
+        
+        # Dedupliziere
+        line_lower = line.lower()
+        if line_lower in seen:
+            continue
+        seen.add(line_lower)
+        cleaned.append(line)
     
-    path = parsed.path.lower()
-    
-    if not ("/kaufangebote/" in path or "/mietangebote/" in path):
-        return False
-    
-    if path in ["/kaufangebote/", "/mietangebote/", "/kaufangebote", "/mietangebote"]:
-        return False
-    
-    # Filtere Kategorie-Seiten
-    if "diskrete-kaufangebote" in path:
-        return False
-    
-    return True
+    return cleaned
+
+def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
+    """Hole HTML und parse mit BeautifulSoup"""
+    time.sleep(delay)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "lxml")
 
 # ===========================================================================
-# AIRTABLE FUNCTIONS (gekürzt)
+# AIRTABLE FUNCTIONS
 # ===========================================================================
 
 def airtable_table_segment() -> str:
+    """Gibt base/table Segment für Airtable API zurück"""
     if not AIRTABLE_BASE or not AIRTABLE_TABLE_ID:
         return ""
     return f"{AIRTABLE_BASE}/{AIRTABLE_TABLE_ID}"
 
 def airtable_headers() -> dict:
+    """Airtable API Headers"""
     return {
         "Authorization": f"Bearer {AIRTABLE_TOKEN}",
         "Content-Type": "application/json"
     }
 
 def airtable_list_all() -> tuple:
+    """Liste alle Records aus Airtable"""
     url = f"https://api.airtable.com/v0/{airtable_table_segment()}"
     headers = airtable_headers()
+    
     all_records = []
     offset = None
     
@@ -136,9 +130,11 @@ def airtable_list_all() -> tuple:
         params = {"pageSize": 100}
         if offset:
             params["offset"] = offset
+        
         r = requests.get(url, headers=headers, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
+        
         all_records.extend(data.get("records", []))
         offset = data.get("offset")
         if not offset:
@@ -149,9 +145,18 @@ def airtable_list_all() -> tuple:
     fields = [rec.get("fields", {}) for rec in all_records]
     return ids, fields
 
+def airtable_existing_fields() -> set:
+    """Ermittle existierende Felder"""
+    _, all_fields = airtable_list_all()
+    if not all_fields:
+        return set()
+    return set(all_fields[0].keys())
+
 def airtable_batch_create(records: List[dict]):
+    """Erstelle Records in Batches"""
     url = f"https://api.airtable.com/v0/{airtable_table_segment()}"
     headers = airtable_headers()
+    
     for i in range(0, len(records), 10):
         batch = records[i:i+10]
         payload = {"records": [{"fields": r} for r in batch]}
@@ -160,8 +165,10 @@ def airtable_batch_create(records: List[dict]):
         time.sleep(0.2)
 
 def airtable_batch_update(updates: List[dict]):
+    """Update Records in Batches"""
     url = f"https://api.airtable.com/v0/{airtable_table_segment()}"
     headers = airtable_headers()
+    
     for i in range(0, len(updates), 10):
         batch = updates[i:i+10]
         payload = {"records": batch}
@@ -170,8 +177,10 @@ def airtable_batch_update(updates: List[dict]):
         time.sleep(0.2)
 
 def airtable_batch_delete(record_ids: List[str]):
+    """Lösche Records in Batches"""
     url = f"https://api.airtable.com/v0/{airtable_table_segment()}"
     headers = airtable_headers()
+    
     for i in range(0, len(record_ids), 10):
         batch = record_ids[i:i+10]
         params = {"records[]": batch}
@@ -180,309 +189,276 @@ def airtable_batch_delete(record_ids: List[str]):
         time.sleep(0.2)
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
+    """Bereinige Record für Airtable"""
     if not allowed_fields:
         return record
-    return {k: v for k, v in record.items() if k in allowed_fields}
-
-def airtable_existing_fields() -> set:
-    _, all_fields = airtable_list_all()
-    if not all_fields:
-        return set()
-    return set(all_fields[0].keys())
+    return {k: v for k, v in record.items() if k in allowed_fields or not allowed_fields}
 
 # ===========================================================================
-# SCRAPING MIT SELENIUM
+# EXTRACTION FUNCTIONS
 # ===========================================================================
 
-def collect_property_links_selenium(driver) -> List[str]:
-    """Sammle alle Immobilien-Links mit Selenium"""
-    print(f"\n{'='*70}")
-    print("[SELENIUM] Sammle Immobilien-Links...")
-    print(f"{'='*70}\n")
-    
-    all_links = set()
-    
-    # 1. Kaufangebote
-    print(f"[1/2] Lade Kaufangebote: {KAUFANGEBOTE_URL}")
-    try:
-        driver.get(KAUFANGEBOTE_URL)
-        time.sleep(PAGE_LOAD_WAIT)
-        
-        # Finde alle Links
-        link_elements = driver.find_elements(By.TAG_NAME, "a")
-        for elem in link_elements:
+def extract_price(soup: BeautifulSoup, page_text: str) -> str:
+    """Extrahiere Preis"""
+    # Suche nach Preis-Pattern
+    for pattern in [
+        r"Kaufpreis[:\s]+€?\s*([\d.,]+)\s*€?",
+        r"Kaltmiete[:\s]+€?\s*([\d.,]+)\s*€?",
+        r"Miete[:\s]+€?\s*([\d.,]+)\s*€?",
+        r"Preis[:\s]+€?\s*([\d.,]+)\s*€?"
+    ]:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            preis_str = m.group(1).replace(".", "").replace(",", ".")
             try:
-                href = elem.get_attribute("href")
-                if href and is_valid_property_url(href):
-                    all_links.add(href)
+                preis_num = float(preis_str)
+                if preis_num > 100:  # Plausibilitätsprüfung
+                    return f"€{int(preis_num):,}".replace(",", ".")
             except:
                 pass
-        
-        print(f"  ✓ Gefunden: {len([l for l in all_links if '/kaufangebote/' in l])} Kaufangebote")
-    except Exception as e:
-        print(f"  ✗ Fehler: {e}")
     
-    # 2. Mietangebote
-    print(f"\n[2/2] Lade Mietangebote: {MIETANGEBOTE_URL}")
-    try:
-        driver.get(MIETANGEBOTE_URL)
-        time.sleep(PAGE_LOAD_WAIT)
-        
-        link_elements = driver.find_elements(By.TAG_NAME, "a")
-        for elem in link_elements:
-            try:
-                href = elem.get_attribute("href")
-                if href and is_valid_property_url(href):
-                    all_links.add(href)
-            except:
-                pass
-        
-        print(f"  ✓ Gefunden: {len([l for l in all_links if '/mietangebote/' in l])} Mietangebote")
-    except Exception as e:
-        print(f"  ✗ Fehler: {e}")
-    
-    all_links = list(all_links)
-    
-    print(f"\n{'='*70}")
-    print(f"[GESAMT] {len(all_links)} Immobilien gefunden")
-    print(f"{'='*70}\n")
-    
-    # Zeige erste 3 Links als Beispiel
-    for i, link in enumerate(all_links[:3], 1):
-        print(f"  {i}. {link}")
-    if len(all_links) > 3:
-        print(f"  ... und {len(all_links)-3} weitere")
-    print()
-    
-    return all_links
-
-def extract_all_images_selenium(driver) -> List[str]:
-    """Extrahiere alle Bilder mit Selenium"""
-    images = []
-    seen = set()
-    
-    try:
-        img_elements = driver.find_elements(By.TAG_NAME, "img")
-        for img in img_elements:
-            try:
-                src = img.get_attribute("src") or img.get_attribute("data-src") or img.get_attribute("data-lazy-src")
-                
-                if not src:
-                    continue
-                
-                # Filtere Logos/Icons
-                if any(x in src.lower() for x in ["logo", "icon", "favicon", "banner"]):
-                    continue
-                
-                # Prüfe Bildformate
-                if any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                    if src not in seen:
-                        seen.add(src)
-                        images.append(src)
-            except:
-                pass
-    except:
-        pass
-    
-    return images
-
-def parse_detail_page_selenium(driver, url: str) -> dict:
-    """Parse Immobilien-Detailseite mit Selenium"""
-    print(f"  [LOAD] {url[:70]}...")
-    
-    try:
-        driver.get(url)
-        time.sleep(PAGE_LOAD_WAIT)
-        
-        # Hole HTML nachdem JavaScript geladen hat
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, "lxml")
-        page_text = soup.get_text("\n", strip=True)
-        
-        # Titel - mit Selenium
-        title = ""
-        try:
-            title_elem = driver.find_element(By.CSS_SELECTOR, "h1, .entry-title, .property-title")
-            title = _norm(title_elem.text)
-        except:
-            # Fallback zu BeautifulSoup
-            for h in soup.find_all(["h1", "h2"]):
-                title = _norm(h.get_text())
-                if len(title) > 5:
-                    break
-        
-        # Objektnummer
-        objektnummer = ""
-        patterns = [
-            r"Objekt[:\s\-]*(?:Nr|nummer)[:\s\-]*([A-Za-z0-9\-/]+)",
-            r"ImmoNr[:\s\-]*([A-Za-z0-9\-/]+)",
-            r"ID[:\s\-]*([A-Za-z0-9\-/]+)",
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, page_text, re.IGNORECASE)
-            if m:
-                objektnummer = m.group(1).strip()
-                break
-        
-        # Preis - erweiterte Patterns
-        preis = ""
-        preis_patterns = [
-            r"Kaufpreis[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
-            r"Kaltmiete[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
-            r"Preis[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
-            r"(?:EUR|€)\s*([\d.,]+)",
-        ]
-        
-        for pattern in preis_patterns:
-            m = re.search(pattern, page_text, re.IGNORECASE)
-            if m:
-                preis_str = m.group(1).replace(".", "").replace(",", ".")
-                try:
-                    preis_num = float(preis_str)
-                    if 1000 < preis_num < 10000000:  # Plausibilitätsprüfung
-                        preis = f"€{int(preis_num):,}".replace(",", ".")
-                        break
-                except:
-                    continue
-        
-        # PLZ/Ort
-        ort = ""
-        m = re.search(r"\b(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-\s/]+)", page_text)
-        if m:
-            ort = f"{m.group(1)} {_norm(m.group(2))}"
-        
-        # Vermarktungsart
-        vermarktungsart = "Kaufen"
-        if "/mietangebote/" in url.lower():
-            vermarktungsart = "Mieten"
-        
-        # Wohnfläche
-        wohnflaeche = ""
-        m = re.search(r"(?:Wohnfläche|Wfl\.)[:\s]+(?:ca\.\s*)?([\d.,]+)\s*m²", page_text, re.IGNORECASE)
-        if m:
-            wohnflaeche = f"{m.group(1)} m²"
-        
-        # Grundstücksfläche
-        grundstueck = ""
-        m = re.search(r"(?:Grundstücksfläche|Grundstücksgröße|Grundstück)[:\s]+(?:ca\.\s*)?([\d.,]+)\s*m²", page_text, re.IGNORECASE)
-        if m:
-            grundstueck = f"{m.group(1)} m²"
-        
-        # Zimmer
-        zimmer = ""
-        m = re.search(r"(\d+(?:[,\.]\d+)?)\s*(?:-\s*)?Zimmer", page_text, re.IGNORECASE)
-        if m:
-            zimmer = m.group(1)
-        
-        # Baujahr
-        baujahr = ""
-        m = re.search(r"Baujahr[:\s]+(\d{4})", page_text, re.IGNORECASE)
-        if m:
-            baujahr = m.group(1)
-        
-        # Objekttyp
-        objekttyp = ""
-        types = {
-            "einfamilienhaus": "Einfamilienhaus",
-            "efh": "Einfamilienhaus",
-            "doppelhaushälfte": "Doppelhaushälfte",
-            "dhh": "Doppelhaushälfte",
-            "reihenhaus": "Reihenhaus",
-            "wohnung": "Wohnung",
-            "eigentumswohnung": "Eigentumswohnung",
-            "etw": "Eigentumswohnung",
-            "mehrfamilienhaus": "Mehrfamilienhaus",
-            "mfh": "Mehrfamilienhaus",
-            "grundstück": "Grundstück",
-            "baugrundstück": "Grundstück",
-            "gewerbe": "Gewerbe",
-        }
-        
-        text_lower = (title + " " + page_text).lower()
-        for key, value in types.items():
-            if key in text_lower:
-                objekttyp = value
-                break
-        
-        # Bilder mit Selenium
-        all_images = extract_all_images_selenium(driver)
-        image_url = all_images[0] if all_images else ""
-        
-        # Beschreibung - nur relevante Absätze
-        description_parts = []
-        for p in soup.find_all("p"):
-            text = _norm(p.get_text())
-            
-            if len(text) < 30:
-                continue
-            
-            # Filtere unwichtige Texte
-            skip_words = ["cookie", "datenschutz", "impressum", "newsletter", 
-                         "kontaktformular", "zustimmung", "video laden"]
-            if any(x in text.lower() for x in skip_words):
-                continue
-            
-            description_parts.append(text)
-            if len(description_parts) >= 5:
-                break
-        
-        description = "\n\n".join(description_parts)
-        
-        return {
-            "Titel": title,
-            "URL": url,
-            "Beschreibung": description,
-            "Objektnummer": objektnummer,
-            "Kategorie": vermarktungsart,
-            "Objekttyp": objekttyp,
-            "Preis": preis,
-            "Ort": ort,
-            "Wohnfläche": wohnflaeche,
-            "Grundstück": grundstueck,
-            "Zimmer": zimmer,
-            "Baujahr": baujahr,
-            "Bild_URL": image_url,
-            "Alle_Bilder": ", ".join(all_images),
-            "Anzahl_Bilder": len(all_images),
-        }
-        
-    except Exception as e:
-        print(f"  ✗ Fehler: {e}")
-        return None
+    return ""
 
 def parse_price_to_number(preis_str: str) -> Optional[float]:
+    """Konvertiere Preis-String zu Nummer"""
     if not preis_str:
         return None
+    
+    # Entferne alles außer Zahlen, Punkt und Komma
     clean = re.sub(r"[^0-9.,]", "", preis_str)
     clean = clean.replace(".", "").replace(",", ".")
+    
     try:
         return float(clean)
     except:
         return None
 
+def extract_plz_ort(text: str, title: str = "") -> str:
+    """Extrahiere PLZ und Ort aus Text"""
+    # Zuerst im kompletten Text suchen
+    matches = list(RE_PLZ_ORT.finditer(text))
+    
+    if matches:
+        # Nehme erste PLZ + Ort Kombination
+        m = matches[0]
+        plz = m.group(1)
+        ort = m.group(2).strip()
+        # Bereinige Ort
+        ort = re.sub(r"\s+", " ", ort).strip()
+        ort = ort.split("/")[0].strip()  # Falls "Varel / Obenstrohe"
+        return f"{plz} {ort}"
+    
+    # Fallback: Suche nach Ortsnamen ohne PLZ
+    ort_pattern = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ][a-zäöüß\-]+)?)\b")
+    for m in ort_pattern.finditer(title + " " + text[:500]):
+        ort = m.group(1).strip()
+        if len(ort) > 3 and ort not in ["Haus", "Wohnung", "Grundstück", "Varel"]:
+            return ort
+    
+    return ""
+
+def extract_objektnummer(url: str) -> str:
+    """Extrahiere Objektnummer aus URL"""
+    # URL format: /kaufangebote/efh-in-varel-obenstrohe/
+    parts = url.rstrip("/").split("/")
+    if len(parts) > 0:
+        slug = parts[-1]
+        # Verwende den Slug als eindeutige ID
+        return slug
+    return ""
+
+def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
+    """Extrahiere strukturierte Beschreibung"""
+    lines = []
+    
+    # Titel als erste Zeile
+    if title:
+        lines.append(f"=== {title.upper()} ===")
+    
+    # Suche nach "Die Eckdaten:" Sektion
+    eckdaten_match = re.search(r"Die Eckdaten:\s*(.+?)(?=\n[A-Z][a-z]+:|$)", page_text, re.DOTALL | re.IGNORECASE)
+    if eckdaten_match:
+        eckdaten_text = eckdaten_match.group(1).strip()
+        # Splitte in Zeilen und bereinige
+        eckdaten_lines = [line.strip() for line in eckdaten_text.split("\n") if line.strip()]
+        eckdaten_lines = [line.lstrip("-•").strip() for line in eckdaten_lines]
+        eckdaten_lines = [line for line in eckdaten_lines if len(line) > 10]
+        
+        if eckdaten_lines:
+            lines.append("\n=== ECKDATEN ===")
+            for line in eckdaten_lines[:20]:  # Max 20 Zeilen
+                lines.append(f"• {line}")
+    
+    # Weitere Abschnitte
+    sections = [
+        ("Energieausweis", r"Der Energieausweis:\s*(.+?)(?=\n[A-Z][a-z]+:|$)"),
+        ("Objektbeschreibung", r"(?:Objektbeschreibung|Beschreibung):\s*(.+?)(?=\n[A-Z][a-z]+:|$)"),
+    ]
+    
+    for section_name, pattern in sections:
+        m = re.search(pattern, page_text, re.DOTALL | re.IGNORECASE)
+        if m:
+            section_text = m.group(1).strip()
+            section_lines = [line.strip() for line in section_text.split("\n") if line.strip()]
+            section_lines = [line.lstrip("-•").strip() for line in section_lines]
+            section_lines = [line for line in section_lines if len(line) > 5]
+            
+            if section_lines:
+                lines.append(f"\n=== {section_name.upper()} ===")
+                lines.extend(section_lines[:15])
+    
+    # Bereinige finale Zeilen
+    cleaned_lines = _clean_desc_lines(lines)
+    
+    if cleaned_lines:
+        return "\n\n".join(cleaned_lines)[:12000]
+    
+    # Fallback: Hole alle Paragraphen
+    desc_lines = []
+    for p in soup.find_all("p"):
+        text = _norm(p.get_text(" ", strip=True))
+        if text and len(text) > 50:
+            if not any(skip in text for skip in STOP_STRINGS):
+                desc_lines.append(text)
+    
+    desc_lines = _clean_desc_lines(desc_lines)
+    if desc_lines:
+        return "\n\n".join(desc_lines[:10])[:12000]
+    
+    return ""
+
+def extract_kategorie(page_text: str, title: str) -> str:
+    """Bestimme Kategorie (Kaufen/Mieten)"""
+    text = (title + " " + page_text).lower()
+    
+    # Prüfe auf Miet-Keywords
+    if any(keyword in text for keyword in ["miete", "vermieten", "zur miete", "mietangebote"]):
+        return "Mieten"
+    
+    # Default: Kaufen (da URL /kaufangebote/)
+    return "Kaufen"
+
+def extract_objekttyp(page_text: str, title: str) -> str:
+    """Extrahiere Objekttyp"""
+    text = title + " " + page_text
+    
+    objekttypen = {
+        "Wohnhaus": [r"\bWohnhaus\b", r"\bEinfamilienhaus\b", r"\bEFH\b"],
+        "Eigentumswohnung": [r"\bEigentumswohnung\b", r"\bWohnung\b", r"\bETW\b"],
+        "Baugrundstück": [r"\bBaugrundstück\b", r"\bGrundstück\b"],
+        "Wohnanlage": [r"\bWohnanlage\b", r"\bMehrfamilienhaus\b", r"\bMFH\b"],
+    }
+    
+    for typ, patterns in objekttypen.items():
+        for pattern in patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return typ
+    
+    return "Wohnhaus"  # Default
+
+# ===========================================================================
+# SCRAPING FUNCTIONS
+# ===========================================================================
+
+def collect_detail_links() -> List[str]:
+    """Sammle alle Detailseiten-Links"""
+    print(f"[LIST] Hole {LIST_URL}")
+    soup = soup_get(LIST_URL)
+    
+    links = []
+    
+    # Suche nach Links die zu Immobilien-Details führen
+    # Format: /kaufangebote/[slug]/
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/kaufangebote/" in href and href.count("/") >= 3:
+            # Ignoriere die Hauptseite
+            if href.strip("/") == "kaufangebote":
+                continue
+            
+            full_url = urljoin(BASE, href)
+            if full_url not in links and full_url != LIST_URL:
+                links.append(full_url)
+    
+    print(f"[LIST] Gefunden: {len(links)} Immobilien")
+    return links
+
+def parse_detail(detail_url: str) -> dict:
+    """Parse Detailseite"""
+    soup = soup_get(detail_url)
+    page_text = soup.get_text("\n", strip=True)
+    
+    # Titel - oft in H1 oder H2
+    title = ""
+    for tag in soup.find_all(["h1", "h2"]):
+        text = _norm(tag.get_text(strip=True))
+        if text and len(text) > 10 and "Kaufangebot" not in text:
+            title = text
+            break
+    
+    # Fallback: Suche nach Muster "Wohnhaus in..."
+    if not title:
+        m = re.search(r"(Wohnhaus|Eigentumswohnung|Baugrundstück|Wohnanlage)\s+in\s+[A-Z][\w\s/-]+", page_text)
+        if m:
+            title = m.group(0)
+    
+    # Objektnummer aus URL
+    objektnummer = extract_objektnummer(detail_url)
+    
+    # Preis
+    preis = extract_price(soup, page_text)
+    
+    # PLZ/Ort
+    ort = extract_plz_ort(page_text, title)
+    
+    # Bild-URL - erstes größeres Bild
+    image_url = ""
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if src and ("/wp-content/uploads/" in src or "go-x" in src):
+            # Ignoriere kleine Icons
+            if "logo" not in src.lower() and "icon" not in src.lower():
+                image_url = src if src.startswith("http") else urljoin(BASE, src)
+                break
+    
+    # Kategorie
+    kategorie = extract_kategorie(page_text, title)
+    
+    # Objekttyp
+    objekttyp = extract_objekttyp(page_text, title)
+    
+    # Beschreibung
+    description = extract_description(soup, title, page_text)
+    
+    return {
+        "Titel": title,
+        "URL": detail_url,
+        "Beschreibung": description,
+        "Objektnummer": objektnummer,
+        "Kategorie": kategorie,
+        "Objekttyp": objekttyp,
+        "Preis": preis,
+        "Ort": ort,
+        "Bild_URL": image_url,
+    }
+
 def make_record(row: dict) -> dict:
-    if not row:
-        return None
+    """Erstelle Airtable-Record"""
     preis_value = parse_price_to_number(row["Preis"])
     return {
         "Titel": row["Titel"],
         "Kategorie": row["Kategorie"],
-        "Objekttyp": row.get("Objekttyp", ""),
         "Webseite": row["URL"],
         "Objektnummer": row["Objektnummer"],
+        "Objekttyp": row["Objekttyp"],
         "Beschreibung": row["Beschreibung"],
         "Bild": row["Bild_URL"],
-        "Alle_Bilder": row["Alle_Bilder"],
-        "Anzahl_Bilder": row["Anzahl_Bilder"],
         "Preis": preis_value,
         "Standort": row["Ort"],
-        "Wohnfläche": row.get("Wohnfläche", ""),
-        "Grundstück": row.get("Grundstück", ""),
-        "Zimmer": row.get("Zimmer", ""),
-        "Baujahr": row.get("Baujahr", ""),
     }
 
 def unique_key(fields: dict) -> str:
+    """Eindeutiger Key für Record"""
     obj = (fields.get("Objektnummer") or "").strip()
     if obj:
         return f"obj:{obj}"
@@ -496,115 +472,94 @@ def unique_key(fields: dict) -> str:
 # ===========================================================================
 
 def run():
-    print("\n" + "="*70)
-    print("🏠 HEYEN IMMOBILIEN SCRAPER v3.0 - SELENIUM")
-    print("="*70)
-    print("Quellen:")
-    print(f"  - {KAUFANGEBOTE_URL}")
-    print(f"  - {MIETANGEBOTE_URL}")
-    print("="*70 + "\n")
+    """Hauptfunktion"""
+    print("[HEYEN] Starte Scraper für heyen-immobilien.de")
     
-    # Erstelle WebDriver
-    driver = create_driver()
+    # Sammle Links
+    detail_links = collect_detail_links()
     
-    try:
-        # Sammle Links
-        detail_links = collect_property_links_selenium(driver)
-        
-        if not detail_links:
-            print("\n[WARN] ⚠️  Keine Links gefunden!")
-            return
-        
-        # Scrape Details
-        print(f"{'='*70}")
-        print(f"[SCRAPING] Starte für {len(detail_links)} Immobilien")
-        print(f"{'='*70}\n")
-        
-        all_rows = []
-        for i, url in enumerate(detail_links, 1):
-            print(f"[{i}/{len(detail_links)}]")
-            row = parse_detail_page_selenium(driver, url)
+    if not detail_links:
+        print("[WARN] Keine Links gefunden!")
+        return
+    
+    # Scrape Details
+    all_rows = []
+    for i, url in enumerate(detail_links, 1):
+        try:
+            print(f"[SCRAPE] {i}/{len(detail_links)} | {url}")
+            row = parse_detail(url)
+            record = make_record(row)
             
-            if row:
-                record = make_record(row)
-                if record:
-                    print(f"  ✓ {record['Kategorie']:8} | {record['Titel'][:45]}")
-                    print(f"    {record.get('Objekttyp', 'N/A'):15} | {record.get('Standort', 'N/A')}")
-                    print(f"    Bilder: {record['Anzahl_Bilder']:2} | Preis: {record.get('Preis') or 'N/A'}")
-                    all_rows.append(record)
-        
-        if not all_rows:
-            print("\n[WARN] Keine Datensätze gefunden.")
-            return
-        
-        # CSV speichern
-        csv_file = "heyen_immobilien.csv"
-        cols = ["Titel", "Kategorie", "Objekttyp", "Webseite", "Objektnummer", "Beschreibung", 
-                "Bild", "Alle_Bilder", "Anzahl_Bilder", "Preis", "Standort", 
-                "Wohnfläche", "Grundstück", "Zimmer", "Baujahr"]
-        
-        with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            w.writerows(all_rows)
-        
-        print(f"\n{'='*70}")
-        print(f"✅ ERFOLGREICH!")
-        print(f"{'='*70}")
-        print(f"📄 CSV: {csv_file}")
-        print(f"🏠 Immobilien: {len(all_rows)}")
-        print(f"📷 Gesamt Bilder: {sum(r['Anzahl_Bilder'] for r in all_rows)}")
-        
-        kauf = sum(1 for r in all_rows if r['Kategorie'] == 'Kaufen')
-        miete = sum(1 for r in all_rows if r['Kategorie'] == 'Mieten')
-        print(f"  - Kaufangebote: {kauf}")
-        print(f"  - Mietangebote: {miete}")
-        print(f"{'='*70}\n")
-        
-        # Airtable Sync
-        if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
-            print("\n[AIRTABLE] Starte Synchronisation...")
+            # Zeige Vorschau
+            print(f"  → {record['Kategorie']:8} | {record['Titel'][:60]} | {record.get('Standort', 'N/A')}")
             
-            allowed = airtable_existing_fields()
-            all_ids, all_fields = airtable_list_all()
-            
-            existing = {}
-            for rec_id, f in zip(all_ids, all_fields):
-                k = unique_key(f)
-                existing[k] = (rec_id, f)
-            
-            desired = {}
-            for r in all_rows:
-                k = unique_key(r)
+            all_rows.append(record)
+        except Exception as e:
+            print(f"[ERROR] Fehler bei {url}: {e}")
+            continue
+    
+    if not all_rows:
+        print("[WARN] Keine Datensätze gefunden.")
+        return
+    
+    # Speichere CSV
+    csv_file = "heyen_immobilien.csv"
+    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Objekttyp", "Beschreibung", "Bild", "Preis", "Standort"]
+    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(all_rows)
+    print(f"\n[CSV] Gespeichert: {csv_file} ({len(all_rows)} Zeilen)")
+    
+    # Airtable Sync
+    if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
+        print("\n[AIRTABLE] Starte Synchronisation...")
+        
+        allowed = airtable_existing_fields()
+        all_ids, all_fields = airtable_list_all()
+        
+        existing = {}
+        for rec_id, f in zip(all_ids, all_fields):
+            k = unique_key(f)
+            existing[k] = (rec_id, f)
+        
+        desired = {}
+        for r in all_rows:
+            k = unique_key(r)
+            if k in desired:
+                if len(r.get("Beschreibung", "")) > len(desired[k].get("Beschreibung", "")):
+                    desired[k] = sanitize_record_for_airtable(r, allowed)
+            else:
                 desired[k] = sanitize_record_for_airtable(r, allowed)
-            
-            to_create, to_update, keep = [], [], set()
-            for k, fields in desired.items():
-                if k in existing:
-                    rec_id, old = existing[k]
-                    diff = {fld: val for fld, val in fields.items() if old.get(fld) != val}
-                    if diff:
-                        to_update.append({"id": rec_id, "fields": diff})
-                    keep.add(k)
-                else:
-                    to_create.append(fields)
-            
-            to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
-            
-            print(f"  Create: {len(to_create)} | Update: {len(to_update)} | Delete: {len(to_delete_ids)}")
-            
-            if to_create:
-                airtable_batch_create(to_create)
-            if to_update:
-                airtable_batch_update(to_update)
-            if to_delete_ids:
-                airtable_batch_delete(to_delete_ids)
-            
-            print("  ✓ Synchronisation abgeschlossen\n")
         
-    finally:
-        print("[SELENIUM] Schließe WebDriver...")
-        driver.quit()
+        to_create, to_update, keep = [], [], set()
+        for k, fields in desired.items():
+            if k in existing:
+                rec_id, old = existing[k]
+                diff = {fld: val for fld, val in fields.items() if old.get(fld) != val}
+                if diff:
+                    to_update.append({"id": rec_id, "fields": diff})
+                keep.add(k)
+            else:
+                to_create.append(fields)
+        
+        to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
+        
+        print(f"\n[SYNC] Gesamt → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+        
+        if to_create:
+            print(f"[Airtable] Erstelle {len(to_create)} neue Records...")
+            airtable_batch_create(to_create)
+        if to_update:
+            print(f"[Airtable] Aktualisiere {len(to_update)} Records...")
+            airtable_batch_update(to_update)
+        if to_delete_ids:
+            print(f"[Airtable] Lösche {len(to_delete_ids)} Records...")
+            airtable_batch_delete(to_delete_ids)
+        
+        print("[Airtable] Synchronisation abgeschlossen.\n")
+    else:
+        print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
 if __name__ == "__main__":
     run()
