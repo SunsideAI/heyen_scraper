@@ -592,7 +592,7 @@ def make_record(row: dict) -> dict:
         "Kategorie": row["Kategorie"],
         "Webseite": row["URL"],
         "Objektnummer": row["Objektnummer"],
-        "Objekttyp": row["Objekttyp"],
+        # "Objekttyp": row["Objekttyp"],  # Auskommentiert - Feld existiert nicht in Airtable
         "Beschreibung": row["Beschreibung"],
         "Bild": row["Bild_URL"],
         "Standort": row["Ort"],
