@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HEYEN Immobilien Scraper
-Scrapes: https://www.heyen-immobilien.de/kaufangebote/
-        https://www.heyen-immobilien.de/mietangebote/
+HEYEN Immobilien Scraper v2.0
+Für: https://www.heyen-immobilien.de/kaufangebote/
+     https://www.heyen-immobilien.de/mietangebote/
 
-Version: 1.0
+WICHTIG: Filtert nur Links zur korrekten Domain www.heyen-immobilien.de
 """
 
 import os
@@ -13,15 +13,14 @@ import sys
 import csv
 import json
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Optional
 
 try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError:
-    print("[ERROR] Fehlende Module. Bitte installieren:")
-    print("  pip install requests beautifulsoup4 lxml")
+    print("[ERROR] Fehlende Module: pip install requests beautifulsoup4 lxml")
     sys.exit(1)
 
 # ===========================================================================
@@ -37,26 +36,52 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
-# Rate Limiting
-REQUEST_DELAY = 1.5
+REQUEST_DELAY = 2.0
 
 # ===========================================================================
 # HELPER FUNCTIONS
 # ===========================================================================
 
 def _norm(s: str) -> str:
-    """Normalisiere String"""
     if not s:
         return ""
     return re.sub(r"\s+", " ", s).strip()
 
+def is_valid_property_url(url: str) -> bool:
+    """
+    Prüft ob URL eine echte Immobilien-Detailseite ist
+    MUSS: www.heyen-immobilien.de Domain
+    MUSS: Entweder /kaufangebote/.../ oder /mietangebote/.../
+    NICHT: /kaufangebote/ oder /mietangebote/ (nur Hauptseite)
+    """
+    parsed = urlparse(url)
+    
+    # Muss korrekte Domain sein
+    if parsed.netloc not in ["www.heyen-immobilien.de", "heyen-immobilien.de"]:
+        return False
+    
+    path = parsed.path.lower()
+    
+    # Muss in kaufangebote oder mietangebote sein
+    if not ("/kaufangebote/" in path or "/mietangebote/" in path):
+        return False
+    
+    # Darf NICHT nur die Hauptkategorie-Seite sein
+    if path in ["/kaufangebote/", "/mietangebote/"]:
+        return False
+    
+    # Filtere externe Links
+    if any(x in path for x in ["facebook", "instagram", "youtube", "twitter"]):
+        return False
+    
+    return True
+
 def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
-    """Hole HTML und parse mit BeautifulSoup"""
     time.sleep(delay)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    print(f"  [GET] {url}")
+    print(f"  [GET] {url[:80]}")
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
@@ -141,122 +166,148 @@ def airtable_existing_fields() -> set:
     return set(all_fields[0].keys())
 
 # ===========================================================================
-# HEYEN SCRAPING
+# HEYEN SCRAPING - VERBESSERT
 # ===========================================================================
 
-def extract_detail_links(soup: BeautifulSoup, base_url: str) -> List[str]:
-    """Extrahiere alle Immobilien-Detail-Links"""
-    links = []
-    seen = set()
+def extract_property_links(soup: BeautifulSoup) -> List[str]:
+    """
+    Extrahiere NUR echte Immobilien-Links
+    """
+    links = set()
     
-    # Suche nach Links zu Detailseiten
-    # Heyen verwendet wahrscheinlich Links wie /objekt/... oder /immobilie/...
+    # Methode 1: Alle <a> Tags durchsuchen
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         
-        # Filtere nach typischen Detail-URLs
-        if any(x in href.lower() for x in ["objekt", "detail", "expose", "immobilie"]):
-            full_url = href if href.startswith("http") else urljoin(base_url, href)
-            
-            if full_url not in seen:
-                seen.add(full_url)
-                links.append(full_url)
+        # Mache absolute URL
+        if href and not href.startswith("http"):
+            href = urljoin(BASE_URL, href)
+        
+        # Validiere
+        if is_valid_property_url(href):
+            links.add(href)
     
-    # Alternative: Suche nach Karten/Boxen mit Immobilien
-    for card in soup.find_all(class_=lambda x: x and any(word in str(x).lower() for word in ["property", "immobilie", "objekt", "listing", "card"]) if x else False):
-        link = card.find("a", href=True)
+    # Methode 2: Suche nach WordPress Post-Links (Heyen nutzt WordPress)
+    for article in soup.find_all(["article", "div"], class_=lambda x: x and "post" in str(x).lower() if x else False):
+        link = article.find("a", href=True)
         if link:
             href = link.get("href", "")
-            full_url = href if href.startswith("http") else urljoin(base_url, href)
-            
-            if full_url not in seen:
-                seen.add(full_url)
-                links.append(full_url)
+            if not href.startswith("http"):
+                href = urljoin(BASE_URL, href)
+            if is_valid_property_url(href):
+                links.add(href)
     
-    return links
+    return list(links)
 
 def extract_all_images(soup: BeautifulSoup, detail_url: str) -> List[str]:
-    """Extrahiere alle Bilder"""
+    """Extrahiere ALLE Immobilien-Bilder"""
     images = []
     seen = set()
     
+    # Suche in verschiedenen Attributen
     for img in soup.find_all("img"):
-        src = img.get("src", "") or img.get("data-src", "")
-        if not src or any(x in src.lower() for x in ["logo", "icon", "favicon"]):
+        # src, data-src, data-lazy-src
+        src = img.get("src", "") or img.get("data-src", "") or img.get("data-lazy-src", "")
+        
+        if not src:
             continue
-            
+        
+        # Filtere Logos, Icons, etc.
+        if any(x in src.lower() for x in ["logo", "icon", "favicon", "banner", "button"]):
+            continue
+        
+        # Prüfe Bildformate
         if any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            # Mache absolute URL
             if not src.startswith("http"):
                 src = urljoin(detail_url, src)
+            
             if src not in seen:
                 seen.add(src)
                 images.append(src)
     
+    # Suche auch in srcset
+    for img in soup.find_all("img", srcset=True):
+        srcset = img.get("srcset", "")
+        # srcset Format: "url1 1x, url2 2x" oder "url1 300w, url2 600w"
+        for part in srcset.split(","):
+            url = part.strip().split()[0]  # Nimm nur URL, nicht die Größe
+            if url and any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                if not url.startswith("http"):
+                    url = urljoin(detail_url, url)
+                if url not in seen:
+                    seen.add(url)
+                    images.append(url)
+    
     return images
 
 def parse_detail_page(url: str) -> dict:
-    """Parse Immobilien-Detailseite"""
+    """
+    Parse Immobilien-Detailseite mit verbesserter Extraktion
+    """
     soup = soup_get(url)
     page_text = soup.get_text("\n", strip=True)
     
-    # Titel
+    # Titel - WordPress nutzt oft .entry-title oder h1
     title = ""
-    for selector in ["h1", "h2", ".title", ".property-title"]:
+    for selector in [".entry-title", "h1.title", "h1", ".property-title", "h2"]:
         elem = soup.select_one(selector)
         if elem:
             title = _norm(elem.get_text())
-            if len(title) > 5:
+            if len(title) > 5 and title.lower() not in ["kaufangebote", "mietangebote"]:
                 break
     
-    # Objektnummer
+    # Objektnummer - verschiedene Patterns
     objektnummer = ""
-    m = re.search(r"(?:Objekt[:\s\-]*Nr|ImmoNr|Objektnummer|ID)[:\s\-]+(\S+)", page_text, re.IGNORECASE)
-    if m:
-        objektnummer = m.group(1).strip()
+    patterns = [
+        r"Objekt[:\s\-]*(?:Nr|nummer)[:\s\-]*([A-Za-z0-9\-]+)",
+        r"ImmoNr[:\s\-]*([A-Za-z0-9\-]+)",
+        r"Objektnummer[:\s\-]*([A-Za-z0-9\-]+)",
+        r"ID[:\s\-]*([A-Za-z0-9\-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            objektnummer = m.group(1).strip()
+            break
     
-    # Preis
+    # Preis - erweiterte Patterns
     preis = ""
-    for pattern in [
-        r"Kaufpreis[:\s]+€?\s*([\d.,]+)\s*€?",
-        r"Kaltmiete[:\s]+€?\s*([\d.,]+)\s*€?",
-        r"Preis[:\s]+€?\s*([\d.,]+)\s*€?",
-    ]:
+    preis_patterns = [
+        r"Kaufpreis[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
+        r"Kaltmiete[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
+        r"Preis[:\s]+(?:EUR\s+)?€?\s*([\d.,]+)\s*€?",
+        r"(?:EUR|€)\s*([\d.,]+)",
+    ]
+    
+    for pattern in preis_patterns:
         m = re.search(pattern, page_text, re.IGNORECASE)
         if m:
             preis_str = m.group(1).replace(".", "").replace(",", ".")
             try:
                 preis_num = float(preis_str)
-                if preis_num > 100:
+                if preis_num > 100:  # Plausibilitätsprüfung
                     preis = f"€{int(preis_num):,}".replace(",", ".")
                     break
             except:
-                pass
+                continue
     
-    # PLZ/Ort
+    # PLZ/Ort - auch aus Titel extrahieren
     ort = ""
     m = re.search(r"\b(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-\s/]+)", page_text)
     if m:
         ort = f"{m.group(1)} {_norm(m.group(2))}"
     
-    # Vermarktungsart (Kaufen/Mieten)
+    # Wenn nicht gefunden, aus Titel versuchen
+    if not ort and title:
+        m = re.search(r"in\s+([A-ZÄÖÜ][a-zäöüß\-\s/]+)", title, re.IGNORECASE)
+        if m:
+            ort = _norm(m.group(1))
+    
+    # Vermarktungsart
     vermarktungsart = "Kaufen"
-    if "mietangebote" in url.lower() or re.search(r"\b(zu\s+vermieten|miete|zur\s+miete|kaltmiete)\b", page_text, re.IGNORECASE):
+    if "/mietangebote/" in url.lower() or re.search(r"\b(zu\s+vermieten|miete|zur\s+miete|kaltmiete)\b", page_text, re.IGNORECASE):
         vermarktungsart = "Mieten"
-    
-    # Bilder
-    all_images = extract_all_images(soup, url)
-    image_url = all_images[0] if all_images else ""
-    
-    # Beschreibung
-    description_parts = []
-    for p in soup.find_all("p"):
-        text = _norm(p.get_text())
-        if len(text) > 50 and not any(x in text.lower() for x in ["cookie", "datenschutz", "impressum"]):
-            description_parts.append(text)
-            if len(description_parts) >= 5:
-                break
-    
-    description = "\n\n".join(description_parts)
     
     # Wohnfläche
     wohnflaeche = ""
@@ -264,11 +315,53 @@ def parse_detail_page(url: str) -> dict:
     if m:
         wohnflaeche = f"{m.group(1)} m²"
     
+    # Grundstücksfläche
+    grundstueck = ""
+    m = re.search(r"(?:Grundstücksfläche|Grundstück)[:\s]+(?:ca\.\s*)?([\d.,]+)\s*m²", page_text, re.IGNORECASE)
+    if m:
+        grundstueck = f"{m.group(1)} m²"
+    
     # Zimmer
     zimmer = ""
-    m = re.search(r"(\d+)\s*Zimmer", page_text, re.IGNORECASE)
+    m = re.search(r"(\d+(?:[,\.]\d+)?)\s*Zimmer", page_text, re.IGNORECASE)
     if m:
         zimmer = m.group(1)
+    
+    # Baujahr
+    baujahr = ""
+    m = re.search(r"Baujahr[:\s]+(\d{4})", page_text, re.IGNORECASE)
+    if m:
+        baujahr = m.group(1)
+    
+    # Objekttyp
+    objekttyp = ""
+    types = ["Einfamilienhaus", "Doppelhaushälfte", "Reihenhaus", "Wohnung", 
+             "Mehrfamilienhaus", "Grundstück", "Gewerbe"]
+    for t in types:
+        if t.lower() in page_text.lower() or t.lower() in title.lower():
+            objekttyp = t
+            break
+    
+    # Bilder
+    all_images = extract_all_images(soup, url)
+    image_url = all_images[0] if all_images else ""
+    
+    # Beschreibung - nur relevante Absätze
+    description_parts = []
+    for p in soup.find_all("p"):
+        text = _norm(p.get_text())
+        
+        # Filtere unwichtige Texte
+        if len(text) < 50:
+            continue
+        if any(x in text.lower() for x in ["cookie", "datenschutz", "impressum", "newsletter", "kontaktformular"]):
+            continue
+        
+        description_parts.append(text)
+        if len(description_parts) >= 3:  # Max 3 Absätze
+            break
+    
+    description = "\n\n".join(description_parts)
     
     return {
         "Titel": title,
@@ -278,15 +371,18 @@ def parse_detail_page(url: str) -> dict:
         "Kategorie": vermarktungsart,
         "Preis": preis,
         "Ort": ort,
+        "Objekttyp": objekttyp,
         "Wohnfläche": wohnflaeche,
+        "Grundstück": grundstueck,
         "Zimmer": zimmer,
+        "Baujahr": baujahr,
         "Bild_URL": image_url,
         "Alle_Bilder": ", ".join(all_images),
         "Anzahl_Bilder": len(all_images),
     }
 
 def collect_all_properties() -> List[str]:
-    """Sammle alle Immobilien-Links von Kauf- und Mietangeboten"""
+    """Sammle alle Immobilien-Links"""
     print(f"\n{'='*70}")
     print("[HEYEN] Sammle Immobilien-Links...")
     print(f"{'='*70}\n")
@@ -294,22 +390,26 @@ def collect_all_properties() -> List[str]:
     all_links = []
     
     # 1. Kaufangebote
-    print(f"[1/2] Lade Kaufangebote: {KAUFANGEBOTE_URL}")
+    print(f"[1/2] Lade Kaufangebote...")
     try:
         soup = soup_get(KAUFANGEBOTE_URL)
-        links = extract_detail_links(soup, BASE_URL)
+        links = extract_property_links(soup)
         all_links.extend(links)
         print(f"  ✓ Gefunden: {len(links)} Kaufangebote")
+        for link in links[:3]:
+            print(f"    - {link}")
     except Exception as e:
         print(f"  ✗ Fehler: {e}")
     
     # 2. Mietangebote
-    print(f"\n[2/2] Lade Mietangebote: {MIETANGEBOTE_URL}")
+    print(f"\n[2/2] Lade Mietangebote...")
     try:
         soup = soup_get(MIETANGEBOTE_URL)
-        links = extract_detail_links(soup, BASE_URL)
+        links = extract_property_links(soup)
         all_links.extend(links)
         print(f"  ✓ Gefunden: {len(links)} Mietangebote")
+        for link in links[:3]:
+            print(f"    - {link}")
     except Exception as e:
         print(f"  ✗ Fehler: {e}")
     
@@ -339,6 +439,7 @@ def make_record(row: dict) -> dict:
         "Kategorie": row["Kategorie"],
         "Webseite": row["URL"],
         "Objektnummer": row["Objektnummer"],
+        "Objekttyp": row.get("Objekttyp", ""),
         "Beschreibung": row["Beschreibung"],
         "Bild": row["Bild_URL"],
         "Alle_Bilder": row["Alle_Bilder"],
@@ -346,7 +447,9 @@ def make_record(row: dict) -> dict:
         "Preis": preis_value,
         "Standort": row["Ort"],
         "Wohnfläche": row.get("Wohnfläche", ""),
+        "Grundstück": row.get("Grundstück", ""),
         "Zimmer": row.get("Zimmer", ""),
+        "Baujahr": row.get("Baujahr", ""),
     }
 
 def unique_key(fields: dict) -> str:
@@ -364,14 +467,14 @@ def unique_key(fields: dict) -> str:
 
 def run():
     print("\n" + "="*70)
-    print("🏠 HEYEN IMMOBILIEN SCRAPER v1.0")
+    print("🏠 HEYEN IMMOBILIEN SCRAPER v2.0")
     print("="*70)
     print("Quellen:")
     print(f"  - {KAUFANGEBOTE_URL}")
     print(f"  - {MIETANGEBOTE_URL}")
     print("="*70 + "\n")
     
-    # Sammle alle Links
+    # Sammle Links
     try:
         detail_links = collect_all_properties()
     except Exception as e:
@@ -382,7 +485,6 @@ def run():
     
     if not detail_links:
         print("\n[WARN] ⚠️  Keine Links gefunden!")
-        print("[HINT] Prüfe ob die Website erreichbar ist")
         return
     
     # Scrape Details
@@ -393,16 +495,19 @@ def run():
     all_rows = []
     for i, url in enumerate(detail_links, 1):
         try:
-            print(f"[{i}/{len(detail_links)}] {url[:70]}...")
+            print(f"[{i}/{len(detail_links)}]")
             row = parse_detail_page(url)
             record = make_record(row)
             
             print(f"  ✓ {record['Kategorie']:8} | {record['Titel'][:50]}")
-            print(f"    Bilder: {record['Anzahl_Bilder']} | {record.get('Standort', 'N/A')}")
+            print(f"    {record.get('Objekttyp', 'N/A'):15} | {record.get('Standort', 'N/A')}")
+            print(f"    Bilder: {record['Anzahl_Bilder']} | Preis: {record.get('Preis', 'N/A')}")
             
             all_rows.append(record)
         except Exception as e:
             print(f"  ✗ FEHLER: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     if not all_rows:
@@ -411,9 +516,9 @@ def run():
     
     # CSV speichern
     csv_file = "heyen_immobilien.csv"
-    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Beschreibung", 
+    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Objekttyp", "Beschreibung", 
             "Bild", "Alle_Bilder", "Anzahl_Bilder", "Preis", "Standort", 
-            "Wohnfläche", "Zimmer"]
+            "Wohnfläche", "Grundstück", "Zimmer", "Baujahr"]
     
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -427,7 +532,6 @@ def run():
     print(f"🏠 Immobilien: {len(all_rows)}")
     print(f"📷 Gesamt Bilder: {sum(r['Anzahl_Bilder'] for r in all_rows)}")
     
-    # Statistik
     kauf = sum(1 for r in all_rows if r['Kategorie'] == 'Kaufen')
     miete = sum(1 for r in all_rows if r['Kategorie'] == 'Mieten')
     print(f"  - Kaufangebote: {kauf}")
