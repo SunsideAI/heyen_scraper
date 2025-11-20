@@ -28,7 +28,11 @@ except ImportError:
 # ===========================================================================
 
 BASE = "https://www.heyen-immobilien.de"
-LIST_URL = f"{BASE}/kaufangebote/"
+# Liste von URLs zum Scrapen
+LIST_URLS = [
+    f"{BASE}/kaufangebote/",
+    f"{BASE}/mietangebote/",
+]
 
 # Airtable
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
@@ -201,13 +205,20 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     """Extrahiere Preis"""
     # Suche nach Preis-Pattern in den Eckdaten
-    # Format: "Kaufpreis: 459.500 €" oder "Kaltmiete: 1.250 €"
-    for pattern in [
-        r"Kaufpreis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        r"Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        r"Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        r"Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€"
-    ]:
+    # Verschiedene Formate: "Kaufpreis: 459.500 €" oder "- Kaufpreis: 459.500 €"
+    patterns = [
+        # Mit Doppelpunkt
+        r"[-•]?\s*Kaufpreis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
+        r"[-•]?\s*Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
+        r"[-•]?\s*Warmmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
+        r"[-•]?\s*Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
+        r"[-•]?\s*Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€?",
+        # Ohne Doppelpunkt aber mit Leerzeichen
+        r"Kaufpreis\s+([\d.]+(?:,\d+)?)\s*€",
+        r"Kaltmiete\s+([\d.]+(?:,\d+)?)\s*€",
+    ]
+    
+    for pattern in patterns:
         m = re.search(pattern, page_text, re.IGNORECASE)
         if m:
             preis_str = m.group(1)
@@ -218,7 +229,7 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
                 if preis_num > 100:  # Plausibilitätsprüfung
                     return f"€{int(preis_num):,}".replace(",", ".")
             except:
-                pass
+                continue
     
     return ""
 
@@ -376,27 +387,32 @@ def extract_objekttyp(page_text: str, title: str) -> str:
 # ===========================================================================
 
 def collect_detail_links() -> List[str]:
-    """Sammle alle Detailseiten-Links"""
-    print(f"[LIST] Hole {LIST_URL}")
-    soup = soup_get(LIST_URL)
+    """Sammle alle Detailseiten-Links von allen Angebotsseiten"""
+    all_links = []
     
-    links = []
-    
-    # Suche nach Links die zu Immobilien-Details führen
-    # Format: /kaufangebote/[slug]/
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/kaufangebote/" in href and href.count("/") >= 3:
-            # Ignoriere die Hauptseite
-            if href.strip("/") == "kaufangebote":
-                continue
+    for list_url in LIST_URLS:
+        print(f"[LIST] Hole {list_url}")
+        try:
+            soup = soup_get(list_url)
             
-            full_url = urljoin(BASE, href)
-            if full_url not in links and full_url != LIST_URL:
-                links.append(full_url)
+            # Suche nach Links die zu Immobilien-Details führen
+            # Format: /kaufangebote/[slug]/ oder /mietangebote/[slug]/
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if ("/kaufangebote/" in href or "/mietangebote/" in href) and href.count("/") >= 3:
+                    # Ignoriere die Hauptseiten
+                    if href.strip("/") in ["kaufangebote", "mietangebote"]:
+                        continue
+                    
+                    full_url = urljoin(BASE, href)
+                    if full_url not in all_links and full_url not in LIST_URLS:
+                        all_links.append(full_url)
+        except Exception as e:
+            print(f"[ERROR] Fehler beim Holen von {list_url}: {e}")
+            continue
     
-    print(f"[LIST] Gefunden: {len(links)} Immobilien")
-    return links
+    print(f"[LIST] Gefunden: {len(all_links)} Immobilien gesamt")
+    return all_links
 
 def parse_detail(detail_url: str) -> dict:
     """Parse Detailseite"""
