@@ -316,16 +316,29 @@ def extract_plz_ort(text: str, title: str = "") -> str:
         m = matches[0]
         plz = m.group(1)
         ort = m.group(2).strip()
-        # Bereinige Ort
+        
+        # Bereinige Ort - entferne häufige Zusätze
+        # Pattern: alles nach " - " oder " / " oder ähnlichen Trennern
+        ort = re.split(r'\s*[-–/]\s*', ort)[0].strip()
+        
+        # Entferne explizit "angeboten von..." Zusätze
+        ort = re.sub(r'\s+(angeboten|von|der|die|das|GmbH|Immobilien).*$', '', ort, flags=re.IGNORECASE).strip()
+        
+        # Entferne Sonderzeichen und extra Whitespace
         ort = re.sub(r"\s+", " ", ort).strip()
-        ort = ort.split("/")[0].strip()  # Falls "Varel / Obenstrohe"
+        
+        # Falls Ort immer noch Zusätze hat, nimm nur den ersten Teil
+        if len(ort.split()) > 2:
+            # Mehr als 2 Wörter -> wahrscheinlich Zusatztext
+            ort = " ".join(ort.split()[:2])
+        
         return f"{plz} {ort}"
     
-    # Fallback: Suche nach Ortsnamen ohne PLZ
+    # Fallback: Suche nach Ortsnamen ohne PLZ im Titel
     ort_pattern = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ][a-zäöüß\-]+)?)\b")
     for m in ort_pattern.finditer(title + " " + text[:500]):
         ort = m.group(1).strip()
-        if len(ort) > 3 and ort not in ["Haus", "Wohnung", "Grundstück", "Varel"]:
+        if len(ort) > 3 and ort not in ["Haus", "Wohnung", "Grundstück", "Varel", "Das", "Die", "Der"]:
             return ort
     
     return ""
