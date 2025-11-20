@@ -204,6 +204,8 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 
 def extract_price(page_text: str) -> str:
     """Extrahiere Preis aus dem Seitentext"""
+    print(f"[DEBUG] extract_price called, text length: {len(page_text)}")
+    
     # Suche nach verschiedenen Preis-Patterns
     patterns = [
         # Standard: "Kaufpreis: 459.500 €"
@@ -218,24 +220,39 @@ def extract_price(page_text: str) -> str:
         r"[-•]?\s*Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
     ]
     
-    for pattern in patterns:
+    # Suche nach "Kaufpreis" im Text
+    if "aufpreis" in page_text.lower():
+        idx = page_text.lower().find("aufpreis")
+        context = page_text[max(0, idx-20):min(len(page_text), idx+100)]
+        print(f"[DEBUG] Found 'aufpreis' in text: ...{context}...")
+    
+    for i, pattern in enumerate(patterns, 1):
         m = re.search(pattern, page_text, re.IGNORECASE)
         if m:
             preis_str = m.group(1)
+            print(f"[DEBUG] Pattern {i} matched! Extracted: {preis_str}")
             # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
             preis_clean = preis_str.replace(".", "").replace(",", ".")
             try:
                 preis_num = float(preis_clean)
                 if preis_num > 100:  # Plausibilitätsprüfung
-                    return f"€{int(preis_num):,}".replace(",", ".")
-            except:
+                    result = f"€{int(preis_num):,}".replace(",", ".")
+                    print(f"[DEBUG] Formatted price: {result}")
+                    return result
+                else:
+                    print(f"[DEBUG] Price too small ({preis_num}), continuing...")
+            except Exception as e:
+                print(f"[DEBUG] Error converting price: {e}")
                 continue
     
+    print("[DEBUG] No price found!")
     return ""
 
 def parse_price_to_number(preis_str: str) -> Optional[float]:
     """Konvertiere Preis-String zu Nummer für Airtable"""
+    print(f"[DEBUG] parse_price_to_number - Input: '{preis_str}'")
     if not preis_str:
+        print(f"[DEBUG] parse_price_to_number - Empty input, returning None")
         return None
     
     # Entferne Euro-Symbol und Whitespace
@@ -244,10 +261,14 @@ def parse_price_to_number(preis_str: str) -> Optional[float]:
     # Deutsche Zahlenformate: 459.500 € oder 1.250,50 €
     # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
     clean = clean.replace(".", "").replace(",", ".")
+    print(f"[DEBUG] parse_price_to_number - Cleaned: '{clean}'")
     
     try:
-        return float(clean)
-    except:
+        result = float(clean)
+        print(f"[DEBUG] parse_price_to_number - Result: {result}")
+        return result
+    except Exception as e:
+        print(f"[DEBUG] parse_price_to_number - Error: {e}")
         return None
 
 def extract_plz_ort(text: str, title: str = "") -> str:
@@ -468,7 +489,9 @@ def parse_detail(detail_url: str) -> dict:
     objektnummer = extract_objektnummer(detail_url)
     
     # Preis
+    print(f"[DEBUG] Extracting price from page_text...")
     preis = extract_price(page_text)
+    print(f"[DEBUG] Extracted price: '{preis}'")
     
     # PLZ/Ort
     ort = extract_plz_ort(page_text, title)
@@ -506,7 +529,9 @@ def parse_detail(detail_url: str) -> dict:
 
 def make_record(row: dict) -> dict:
     """Erstelle Airtable-Record"""
+    print(f"[DEBUG] make_record - Input Preis: '{row.get('Preis', 'NOT FOUND')}'")
     preis_value = parse_price_to_number(row["Preis"])
+    print(f"[DEBUG] make_record - Converted Preis: {preis_value}")
     return {
         "Titel": row["Titel"],
         "Kategorie": row["Kategorie"],
@@ -548,16 +573,20 @@ def run():
     all_rows = []
     for i, url in enumerate(detail_links, 1):
         try:
-            print(f"[SCRAPE] {i}/{len(detail_links)} | {url}")
+            print(f"\n[SCRAPE] {i}/{len(detail_links)} | {url}")
             row = parse_detail(url)
+            print(f"[DEBUG] Parsed row - Preis: '{row.get('Preis', 'NOT FOUND')}'")
             record = make_record(row)
             
             # Zeige Vorschau
-            print(f"  → {record['Kategorie']:8} | {record['Titel'][:60]} | {record.get('Standort', 'N/A')}")
+            preis_display = record.get('Preis', 'N/A')
+            print(f"  → {record['Kategorie']:8} | {record['Titel'][:60]} | {record.get('Standort', 'N/A')} | Preis: {preis_display}")
             
             all_rows.append(record)
         except Exception as e:
             print(f"[ERROR] Fehler bei {url}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     if not all_rows:
