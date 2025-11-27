@@ -243,8 +243,11 @@ def extract_price(page_text: str) -> str:
     
     # Suche nach verschiedenen Preis-Patterns
     patterns = [
-        # Standard: "Kaufpreis: 459.500 €"
-        r"[-•]?\s*Kaufpreis(?:vorstellung)?[:\s]+(?:der\s+Eigentümer[:\s]+)?€?\s*([\d.]+(?:,\d+)?)\s*€",
+        # Mit Komma am Ende: "2.700.000,- €" oder "184.500,- €"
+        # Flexibel für: des/der Eigentümers/Eigentümerin
+        r"Kaufpreis(?:vorstellung)?[:\s]+(?:de[rs]\s+)?(?:Eigentümer(?:s|in)?[:\s]+)?€?\s*([\d.]+),?-?\s*€",
+        # Standard ohne Komma: "Kaufpreis: 459.500 €"
+        r"Kaufpreis(?:vorstellung)?[:\s]+(?:de[rs]\s+)?(?:Eigentümer(?:s|in)?[:\s]+)?€?\s*([\d.]+(?:,\d+)?)\s*€",
         # Kaltmiete
         r"[-•]?\s*Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
         # Warmmiete
@@ -266,8 +269,17 @@ def extract_price(page_text: str) -> str:
         if m:
             preis_str = m.group(1)
             print(f"[DEBUG] Pattern {i} matched! Extracted: {preis_str}")
+            
             # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
-            preis_clean = preis_str.replace(".", "").replace(",", ".")
+            # Aber nur wenn es nicht ",00" oder ähnlich ist
+            preis_clean = preis_str.replace(".", "")  # Entferne Tausenderpunkte
+            
+            # Wenn Komma vorhanden, ersetze durch Punkt (für Dezimalstellen)
+            if "," in preis_clean:
+                preis_clean = preis_clean.replace(",", ".")
+            
+            print(f"[DEBUG] Cleaned: {preis_clean}")
+            
             try:
                 preis_num = float(preis_clean)
                 if preis_num > 100:  # Plausibilitätsprüfung
