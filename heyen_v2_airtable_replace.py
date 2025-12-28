@@ -246,6 +246,33 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 # GPT KURZBESCHREIBUNG
 # ===========================================================================
 
+# Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
+KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
+
+def load_kurzbeschreibung_cache():
+    """Lädt existierende Kurzbeschreibungen aus Airtable in den Cache"""
+    global KURZBESCHREIBUNG_CACHE
+    
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        print("[CACHE] Airtable nicht konfiguriert - Cache leer")
+        return
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        for fields in all_fields:
+            obj_nr = fields.get("Objektnummer", "").strip()
+            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
+            if obj_nr and kurzbeschreibung:
+                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
+        
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen aus Airtable geladen")
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Laden: {e}")
+
+def get_cached_kurzbeschreibung(objektnummer: str) -> str:
+    """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
+    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
+
 # Einheitliche Feldstruktur für Kurzbeschreibung
 KURZBESCHREIBUNG_FIELDS = [
     "Objekttyp",
@@ -325,12 +352,22 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
     return "\n".join(output_lines)
 
 def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
-                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "") -> str:
+                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
+                               objektnummer: str = "") -> str:
     """
     Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
     Format ist optimiert für Regex/KI-Matching im Chatbot.
     Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
+    
+    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
     """
+    
+    # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
+    if objektnummer:
+        cached = get_cached_kurzbeschreibung(objektnummer)
+        if cached:
+            print(f"[CACHE] Kurzbeschreibung aus Cache verwendet für {objektnummer[:30]}...")
+            return cached
     
     # Scrape-Daten für Fallback sammeln
     scraped_data = {
@@ -855,6 +892,7 @@ def parse_detail(detail_url: str) -> dict:
     additional_data = extract_additional_data(page_text)
     
     # Kurzbeschreibung via GPT generieren (mit allen verfügbaren Scrape-Daten)
+    # OPTIMIERUNG: Cache-Check passiert in der Funktion
     kurzbeschreibung = generate_kurzbeschreibung(
         beschreibung=description,
         titel=title,
@@ -864,7 +902,8 @@ def parse_detail(detail_url: str) -> dict:
         zimmer=additional_data["zimmer"],
         wohnflaeche=additional_data["wohnflaeche"],
         grundstueck=additional_data["grundstueck"],
-        baujahr=additional_data["baujahr"]
+        baujahr=additional_data["baujahr"],
+        objektnummer=objektnummer
     )
     
     return {
@@ -932,6 +971,10 @@ def unique_key(fields: dict) -> str:
 def run():
     """Hauptfunktion"""
     print("[HEYEN] Starte Scraper für heyen-immobilien.de")
+    
+    # OPTIMIERUNG: Lade existierende Kurzbeschreibungen aus Airtable
+    print("[INIT] Lade Kurzbeschreibungen-Cache aus Airtable...")
+    load_kurzbeschreibung_cache()
     
     # Sammle Links
     detail_links = collect_detail_links()
