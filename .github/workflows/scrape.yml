@@ -31,6 +31,7 @@ jobs:
           AIRTABLE_TOKEN: ${{ secrets.HEYEN_AIRTABLE_TOKEN }}
           AIRTABLE_BASE: ${{ secrets.HEYEN_AIRTABLE_BASE }}
           AIRTABLE_TABLE_ID: ${{ secrets.HEYEN_AIRTABLE_TABLE_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python heyen_v2_airtable_replace.py
       
