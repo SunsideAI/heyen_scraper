@@ -39,6 +39,9 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
+# OpenAI für Kurzbeschreibung
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 # Rate Limiting
 REQUEST_DELAY = 1.5
 
@@ -232,6 +235,83 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
         print(f"[DEBUG]   !!! Please check your Airtable field names (case-sensitive!)")
     
     return sanitized
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG
+# ===========================================================================
+
+def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str) -> str:
+    """
+    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
+    Format ist optimiert für Regex/KI-Matching im Chatbot.
+    """
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY nicht gesetzt - Kurzbeschreibung wird übersprungen")
+        return ""
+    
+    # Baue den Prompt
+    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
+
+TITEL: {titel}
+KATEGORIE: {kategorie}
+PREIS: {preis}
+STANDORT: {ort}
+BESCHREIBUNG:
+{beschreibung[:3000]}
+
+Erstelle eine Kurzbeschreibung im folgenden Format (nur die relevanten Felder ausfüllen, unbekannte weglassen):
+
+Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/etc.]
+Zimmer: [Anzahl]
+Schlafzimmer: [Anzahl]
+Wohnfläche: [X m²]
+Grundstück: [X m²]
+Baujahr: [Jahr]
+Kategorie: [Kaufen/Mieten]
+Preis: [Preis in €]
+Standort: [PLZ Ort]
+Energieeffizienz: [Klasse wenn vorhanden]
+Besonderheiten: [Kurze kommaseparierte Liste: z.B. Garten, Garage, Balkon, Kamin, PV-Anlage, Fußbodenheizung, Einbauküche, etc.]
+
+WICHTIG: 
+- Nur Fakten aus der Beschreibung verwenden
+- Keine Interpretationen oder Vermutungen
+- Kompakt und suchbar halten
+- Zahlen ohne Formatierung (z.B. "180" statt "ca. 180")"""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen für eine Suchfunktion."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 500,
+            "temperature": 0.1  # Niedrige Temperatur für konsistente Ergebnisse
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        kurzbeschreibung = result["choices"][0]["message"]["content"].strip()
+        
+        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
+        return kurzbeschreibung
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        return ""
 
 # ===========================================================================
 # EXTRACTION FUNCTIONS
@@ -590,10 +670,20 @@ def parse_detail(detail_url: str) -> dict:
     # Beschreibung
     description = extract_description(soup, title, page_text)
     
+    # Kurzbeschreibung via GPT generieren
+    kurzbeschreibung = generate_kurzbeschreibung(
+        beschreibung=description,
+        titel=title,
+        kategorie=kategorie,
+        preis=preis,
+        ort=ort
+    )
+    
     return {
         "Titel": title,
         "URL": detail_url,
         "Beschreibung": description,
+        "Kurzbeschreibung": kurzbeschreibung,
         "Objektnummer": objektnummer,
         "Kategorie": kategorie,
         "Objekttyp": objekttyp,
@@ -622,6 +712,11 @@ def make_record(row: dict) -> dict:
         "Bild": row["Bild_URL"],
         "Standort": row["Ort"],
     }
+    
+    # Kurzbeschreibung hinzufügen wenn vorhanden
+    if row.get("Kurzbeschreibung"):
+        record["Kurzbeschreibung"] = row["Kurzbeschreibung"]
+        print(f"[DEBUG] make_record - Added Kurzbeschreibung ({len(row['Kurzbeschreibung'])} chars)")
     
     # Nur Preis hinzufügen wenn vorhanden
     if preis_value is not None:
@@ -683,7 +778,7 @@ def run():
     
     # Speichere CSV
     csv_file = "heyen_immobilien.csv"
-    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Objekttyp", "Beschreibung", "Bild", "Preis", "Standort"]
+    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Objekttyp", "Beschreibung", "Kurzbeschreibung", "Bild", "Preis", "Standort"]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
