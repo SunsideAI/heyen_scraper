@@ -246,44 +246,154 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 # GPT KURZBESCHREIBUNG
 # ===========================================================================
 
-def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str) -> str:
+# Einheitliche Feldstruktur für Kurzbeschreibung
+KURZBESCHREIBUNG_FIELDS = [
+    "Objekttyp",
+    "Zimmer", 
+    "Schlafzimmer",
+    "Wohnfläche",
+    "Grundstück",
+    "Baujahr",
+    "Kategorie",
+    "Preis",
+    "Standort",
+    "Energieeffizienz",
+    "Besonderheiten"
+]
+
+def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
+    """
+    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
+    Stellt einheitliche Struktur sicher.
+    """
+    # Parse GPT Output in Dictionary
+    parsed = {}
+    for line in gpt_output.strip().split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value != "-":
+                parsed[key] = value
+    
+    # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
+    scrape_mapping = {
+        "Zimmer": "zimmer",
+        "Wohnfläche": "wohnflaeche", 
+        "Grundstück": "grundstueck",
+        "Baujahr": "baujahr",
+        "Kategorie": "kategorie",
+        "Preis": "preis",
+        "Standort": "standort",
+    }
+    
+    # Fülle fehlende Felder aus Scrape-Daten
+    for field, scrape_key in scrape_mapping.items():
+        if field not in parsed or not parsed[field] or parsed[field] == "-":
+            scrape_value = scraped_data.get(scrape_key, "")
+            if scrape_value:
+                # Formatiere Preis
+                if field == "Preis" and scrape_value:
+                    try:
+                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
+                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                    except:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Wohnfläche
+                elif field == "Wohnfläche" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Grundstück
+                elif field == "Grundstück" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                else:
+                    parsed[field] = str(scrape_value)
+    
+    # Baue einheitliche Ausgabe mit allen Feldern
+    output_lines = []
+    for field in KURZBESCHREIBUNG_FIELDS:
+        value = parsed.get(field, "-")
+        if not value or value.strip() == "":
+            value = "-"
+        output_lines.append(f"{field}: {value}")
+    
+    return "\n".join(output_lines)
+
+def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
+                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "") -> str:
     """
     Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
     Format ist optimiert für Regex/KI-Matching im Chatbot.
+    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
     """
-    if not OPENAI_API_KEY:
-        print("[WARN] OPENAI_API_KEY nicht gesetzt - Kurzbeschreibung wird übersprungen")
-        return ""
     
-    # Baue den Prompt
+    # Scrape-Daten für Fallback sammeln
+    scraped_data = {
+        "kategorie": kategorie,
+        "preis": preis,
+        "standort": ort,
+        "zimmer": zimmer,
+        "wohnflaeche": wohnflaeche,
+        "grundstueck": grundstueck,
+        "baujahr": baujahr,
+    }
+    
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
+        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
+    
+    # Baue zusätzliche Daten-Sektion für GPT
+    zusatz_daten = []
+    if zimmer:
+        zusatz_daten.append(f"Zimmer: {zimmer}")
+    if wohnflaeche:
+        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
+    if grundstueck:
+        zusatz_daten.append(f"Grundstück: {grundstueck}")
+    if baujahr:
+        zusatz_daten.append(f"Baujahr: {baujahr}")
+    
+    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
+    
     prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
 
 TITEL: {titel}
 KATEGORIE: {kategorie}
-PREIS: {preis}
-STANDORT: {ort}
+PREIS: {preis if preis else 'Nicht angegeben'}
+STANDORT: {ort if ort else 'Nicht angegeben'}
+
+ZUSÄTZLICHE DATEN (aus Scraping):
+{zusatz_text}
+
 BESCHREIBUNG:
 {beschreibung[:3000]}
 
-Erstelle eine Kurzbeschreibung im folgenden Format (nur die relevanten Felder ausfüllen, unbekannte weglassen):
+Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
 
-Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/etc.]
-Zimmer: [Anzahl]
-Schlafzimmer: [Anzahl]
-Wohnfläche: [X m²]
-Grundstück: [X m²]
-Baujahr: [Jahr]
+Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
+Zimmer: [Anzahl oder "-"]
+Schlafzimmer: [Anzahl oder "-"]
+Wohnfläche: [X m² oder "-"]
+Grundstück: [X m² oder "-"]
+Baujahr: [Jahr oder "-"]
 Kategorie: [Kaufen/Mieten]
-Preis: [Preis in €]
-Standort: [PLZ Ort]
-Energieeffizienz: [Klasse wenn vorhanden]
-Besonderheiten: [Kurze kommaseparierte Liste: z.B. Garten, Garage, Balkon, Kamin, PV-Anlage, Fußbodenheizung, Einbauküche, etc.]
+Preis: [Preis in € oder "-"]
+Standort: [PLZ Ort oder "-"]
+Energieeffizienz: [Klasse A+ bis H oder "-"]
+Besonderheiten: [Kommaseparierte Liste oder "-"]
 
 WICHTIG: 
-- Nur Fakten aus der Beschreibung verwenden
-- Keine Interpretationen oder Vermutungen
-- Kompakt und suchbar halten
-- Zahlen ohne Formatierung (z.B. "180" statt "ca. 180")"""
+- ALLE 11 Felder MÜSSEN in der Ausgabe sein
+- Nutze "-" für unbekannte/fehlende Werte
+- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
+- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
+- Preis im Format "XXX.XXX €" """
 
     try:
         headers = {
@@ -294,11 +404,11 @@ WICHTIG:
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen für eine Suchfunktion."},
+                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 500,
-            "temperature": 0.1  # Niedrige Temperatur für konsistente Ergebnisse
+            "temperature": 0.1
         }
         
         response = requests.post(
@@ -310,14 +420,18 @@ WICHTIG:
         response.raise_for_status()
         
         result = response.json()
-        kurzbeschreibung = result["choices"][0]["message"]["content"].strip()
+        gpt_output = result["choices"][0]["message"]["content"].strip()
         
-        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
+        # Normalisiere und fülle fehlende Felder
+        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
+        
+        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
         return kurzbeschreibung
         
     except Exception as e:
         print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
-        return ""
+        # Fallback: Erstelle aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
 
 # ===========================================================================
 # EXTRACTION FUNCTIONS
@@ -450,6 +564,67 @@ def extract_objektnummer(url: str) -> str:
         # Verwende den Slug als eindeutige ID
         return slug
     return ""
+
+def extract_additional_data(page_text: str) -> dict:
+    """Extrahiere zusätzliche Daten für die Kurzbeschreibung"""
+    data = {
+        "zimmer": "",
+        "wohnflaeche": "",
+        "grundstueck": "",
+        "baujahr": ""
+    }
+    
+    # Zimmer extrahieren
+    zimmer_patterns = [
+        r"(\d+)\s*Zimmer",
+        r"Zimmer[:\s]+(\d+)",
+        r"(\d+)-Zimmer",
+    ]
+    for pattern in zimmer_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["zimmer"] = m.group(1)
+            break
+    
+    # Wohnfläche extrahieren
+    wohnflaeche_patterns = [
+        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfläche",
+        r"Wohnfläche[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
+        r"(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfl",
+    ]
+    for pattern in wohnflaeche_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["wohnflaeche"] = m.group(1).replace(",", ".")
+            break
+    
+    # Grundstück extrahieren
+    grundstueck_patterns = [
+        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Grundstück",
+        r"Grundstück[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
+        r"(\d+(?:[.,]\d+)?)\s*m²\s*(?:großes?\s+)?Grundstück",
+    ]
+    for pattern in grundstueck_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["grundstueck"] = m.group(1).replace(",", ".")
+            break
+    
+    # Baujahr extrahieren
+    baujahr_patterns = [
+        r"Baujahr[:\s]+(\d{4})",
+        r"aus\s+(?:dem\s+)?(?:Baujahr\s+)?(\d{4})",
+        r"(\d{4})\s+(?:erbaut|gebaut)",
+    ]
+    for pattern in baujahr_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            jahr = int(m.group(1))
+            if 1800 <= jahr <= 2030:
+                data["baujahr"] = str(jahr)
+                break
+    
+    return data
 
 def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
     """Extrahiere strukturierte Beschreibung"""
@@ -676,13 +851,20 @@ def parse_detail(detail_url: str) -> dict:
     # Beschreibung
     description = extract_description(soup, title, page_text)
     
-    # Kurzbeschreibung via GPT generieren
+    # Zusätzliche Daten extrahieren
+    additional_data = extract_additional_data(page_text)
+    
+    # Kurzbeschreibung via GPT generieren (mit allen verfügbaren Scrape-Daten)
     kurzbeschreibung = generate_kurzbeschreibung(
         beschreibung=description,
         titel=title,
         kategorie=kategorie,
         preis=preis,
-        ort=ort
+        ort=ort,
+        zimmer=additional_data["zimmer"],
+        wohnflaeche=additional_data["wohnflaeche"],
+        grundstueck=additional_data["grundstueck"],
+        baujahr=additional_data["baujahr"]
     )
     
     return {
@@ -786,7 +968,7 @@ def run():
     csv_file = "heyen_immobilien.csv"
     cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Objekttyp", "Beschreibung", "Kurzbeschreibung", "Bild", "Preis", "Standort"]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
         w.writeheader()
         w.writerows(all_rows)
     print(f"\n[CSV] Gespeichert: {csv_file} ({len(all_rows)} Zeilen)")
