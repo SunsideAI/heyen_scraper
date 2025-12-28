@@ -219,12 +219,18 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
     print(f"[DEBUG]   Record keys: {list(record.keys())}")
     print(f"[DEBUG]   Record Preis value: {record.get('Preis', 'NOT IN RECORD')}")
     
+    # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
+    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
+    
     # Wenn keine allowed_fields gesetzt sind (z.B. erste Records), akzeptiere alles
     if not allowed_fields:
         print(f"[DEBUG]   -> Returning full record (no field restrictions)")
         return record
     
-    sanitized = {k: v for k, v in record.items() if k in allowed_fields}
+    # Kombiniere allowed_fields mit ALWAYS_ALLOWED
+    all_allowed = allowed_fields | ALWAYS_ALLOWED
+    
+    sanitized = {k: v for k, v in record.items() if k in all_allowed}
     print(f"[DEBUG]   -> Sanitized keys: {list(sanitized.keys())}")
     print(f"[DEBUG]   -> Sanitized Preis: {sanitized.get('Preis', 'REMOVED!')}")
     
