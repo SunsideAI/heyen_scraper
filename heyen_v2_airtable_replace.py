@@ -172,13 +172,6 @@ def airtable_batch_create(records: List[dict]):
         batch = records[i:i+10]
         payload = {"records": [{"fields": r} for r in batch]}
         
-        print(f"[DEBUG] Creating batch {i//10 + 1}, first record:")
-        if batch:
-            first_record = batch[0]
-            print(f"[DEBUG]   Titel: {first_record.get('Titel', 'N/A')[:40]}")
-            print(f"[DEBUG]   Preis: {first_record.get('Preis', 'MISSING')} (type: {type(first_record.get('Preis', None))})")
-            print(f"[DEBUG]   Full record keys: {list(first_record.keys())}")
-        
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if not r.ok:
@@ -214,36 +207,100 @@ def airtable_batch_delete(record_ids: List[str]):
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
     """Bereinige Record für Airtable"""
-    print(f"[DEBUG] sanitize_record_for_airtable called")
-    print(f"[DEBUG]   Allowed fields: {allowed_fields if allowed_fields else 'NONE (will accept all)'}")
-    print(f"[DEBUG]   Record keys: {list(record.keys())}")
-    print(f"[DEBUG]   Record Preis value: {record.get('Preis', 'NOT IN RECORD')}")
-    
     # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
     ALWAYS_ALLOWED = {"Kurzbeschreibung"}
     
     # Wenn keine allowed_fields gesetzt sind (z.B. erste Records), akzeptiere alles
     if not allowed_fields:
-        print(f"[DEBUG]   -> Returning full record (no field restrictions)")
         return record
     
     # Kombiniere allowed_fields mit ALWAYS_ALLOWED
     all_allowed = allowed_fields | ALWAYS_ALLOWED
     
     sanitized = {k: v for k, v in record.items() if k in all_allowed}
-    print(f"[DEBUG]   -> Sanitized keys: {list(sanitized.keys())}")
-    print(f"[DEBUG]   -> Sanitized Preis: {sanitized.get('Preis', 'REMOVED!')}")
-    
-    # Check if Preis field was removed
-    if "Preis" in record and "Preis" not in sanitized:
-        print(f"[DEBUG]   !!! WARNING: 'Preis' field was REMOVED during sanitization!")
-        print(f"[DEBUG]   !!! This means the Airtable table does not have a field named 'Preis'")
-        print(f"[DEBUG]   !!! Please check your Airtable field names (case-sensitive!)")
-    
     return sanitized
 
 # ===========================================================================
-# GPT KURZBESCHREIBUNG
+# VALIDIERUNG - Leere Records filtern
+# ===========================================================================
+
+def is_valid_record(record: dict) -> bool:
+    """
+    Prüft ob ein Record gültig ist (nicht leer).
+    Ein Record ist ungültig wenn:
+    - Kein Titel vorhanden
+    - Keine URL/Webseite vorhanden
+    - Weniger als 3 ausgefüllte Felder
+    """
+    # Pflichtfelder
+    titel = (record.get("Titel") or "").strip()
+    webseite = (record.get("Webseite") or "").strip()
+    
+    if not titel or not webseite:
+        return False
+    
+    # Zähle ausgefüllte Felder (ohne leere Strings)
+    filled_fields = 0
+    for key, value in record.items():
+        if value is not None:
+            if isinstance(value, str) and value.strip():
+                filled_fields += 1
+            elif isinstance(value, (int, float)) and value > 0:
+                filled_fields += 1
+    
+    # Mindestens 3 ausgefüllte Felder (Titel, Webseite, + 1 weiteres)
+    return filled_fields >= 3
+
+
+def filter_valid_records(records: list) -> list:
+    """Filtert ungültige/leere Records heraus"""
+    valid = []
+    invalid_count = 0
+    
+    for record in records:
+        if is_valid_record(record):
+            valid.append(record)
+        else:
+            invalid_count += 1
+            print(f"[FILTER] Ungültiger Record übersprungen: {record.get('Titel', 'KEIN TITEL')[:50]}")
+    
+    if invalid_count > 0:
+        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
+    
+    return valid
+
+
+def cleanup_empty_airtable_records():
+    """
+    Löscht leere/ungültige Records aus Airtable.
+    Wird am Ende des Scrapers aufgerufen.
+    """
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        return
+    
+    print("[CLEANUP] Prüfe Airtable auf leere Records...")
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        
+        to_delete = []
+        for rec_id, fields in zip(all_ids, all_fields):
+            if not is_valid_record(fields):
+                to_delete.append(rec_id)
+                print(f"[CLEANUP] Leerer Record gefunden: {fields.get('Titel', 'KEIN TITEL')[:40]}")
+        
+        if to_delete:
+            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
+            airtable_batch_delete(to_delete)
+            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
+        else:
+            print("[CLEANUP] ✅ Keine leeren Records gefunden")
+            
+    except Exception as e:
+        print(f"[CLEANUP] Fehler: {e}")
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG - NEUE VERSION
 # ===========================================================================
 
 # Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
@@ -273,15 +330,13 @@ def get_cached_kurzbeschreibung(objektnummer: str) -> str:
     """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
     return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
 
-# Einheitliche Feldstruktur für Kurzbeschreibung
+# Erlaubte Felder (Whitelist - streng) - NEUE VERSION ohne Schlafzimmer/Kategorie
 KURZBESCHREIBUNG_FIELDS = [
     "Objekttyp",
-    "Zimmer", 
-    "Schlafzimmer",
+    "Baujahr",
     "Wohnfläche",
     "Grundstück",
-    "Baujahr",
-    "Kategorie",
+    "Zimmer",
     "Preis",
     "Standort",
     "Energieeffizienz",
@@ -290,8 +345,8 @@ KURZBESCHREIBUNG_FIELDS = [
 
 def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
     """
-    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
-    Stellt einheitliche Struktur sicher.
+    Normalisiert die GPT-Ausgabe.
+    NEUE VERSION: Keine Platzhalter, nur vorhandene Felder.
     """
     # Parse GPT Output in Dictionary
     parsed = {}
@@ -300,7 +355,8 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
             key, value = line.split(":", 1)
             key = key.strip()
             value = value.strip()
-            if value and value != "-":
+            # Nur nicht-leere Werte ohne Platzhalter
+            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
                 parsed[key] = value
     
     # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
@@ -309,45 +365,41 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
         "Wohnfläche": "wohnflaeche", 
         "Grundstück": "grundstueck",
         "Baujahr": "baujahr",
-        "Kategorie": "kategorie",
         "Preis": "preis",
         "Standort": "standort",
     }
     
-    # Fülle fehlende Felder aus Scrape-Daten
+    # Fülle fehlende Felder NUR aus Scrape-Daten wenn vorhanden
     for field, scrape_key in scrape_mapping.items():
-        if field not in parsed or not parsed[field] or parsed[field] == "-":
+        if field not in parsed or not parsed[field]:
             scrape_value = scraped_data.get(scrape_key, "")
-            if scrape_value:
+            if scrape_value and str(scrape_value).strip():
                 # Formatiere Preis
-                if field == "Preis" and scrape_value:
+                if field == "Preis":
                     try:
                         preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                        parsed[field] = f"{int(preis_num)} €"
                     except:
-                        parsed[field] = str(scrape_value)
+                        pass
                 # Formatiere Wohnfläche
-                elif field == "Wohnfläche" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
+                elif field == "Wohnfläche":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
                 # Formatiere Grundstück
-                elif field == "Grundstück" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
+                elif field == "Grundstück":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
                 else:
                     parsed[field] = str(scrape_value)
     
-    # Baue einheitliche Ausgabe mit allen Feldern
+    # Baue Ausgabe NUR mit vorhandenen Feldern (keine leeren Zeilen!)
     output_lines = []
     for field in KURZBESCHREIBUNG_FIELDS:
-        value = parsed.get(field, "-")
-        if not value or value.strip() == "":
-            value = "-"
-        output_lines.append(f"{field}: {value}")
+        value = parsed.get(field, "")
+        if value and value.strip():
+            output_lines.append(f"{field}: {value}")
     
     return "\n".join(output_lines)
 
@@ -355,11 +407,8 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
                                zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
                                objektnummer: str = "") -> str:
     """
-    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
-    Format ist optimiert für Regex/KI-Matching im Chatbot.
-    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
-    
-    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
+    Generiert eine strukturierte Kurzbeschreibung mit GPT.
+    NEUE VERSION: Strenger Prompt, nur objektive Fakten, keine Platzhalter.
     """
     
     # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
@@ -382,55 +431,67 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     
     if not OPENAI_API_KEY:
         print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
-        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
         return normalize_kurzbeschreibung("", scraped_data)
     
-    # Baue zusätzliche Daten-Sektion für GPT
-    zusatz_daten = []
-    if zimmer:
-        zusatz_daten.append(f"Zimmer: {zimmer}")
-    if wohnflaeche:
-        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
-    if grundstueck:
-        zusatz_daten.append(f"Grundstück: {grundstueck}")
-    if baujahr:
-        zusatz_daten.append(f"Baujahr: {baujahr}")
-    
-    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
-    
-    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
+    # NEUER STRENGER PROMPT
+    prompt = f"""# Rolle
+Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
 
+# Aufgabe
+1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
+2. Extrahiere nur eindeutig genannte, objektive Fakten.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
+
+# Eingabedaten
 TITEL: {titel}
 KATEGORIE: {kategorie}
-PREIS: {preis if preis else 'Nicht angegeben'}
-STANDORT: {ort if ort else 'Nicht angegeben'}
+PREIS: {preis if preis else 'nicht angegeben'}
+STANDORT: {ort if ort else 'nicht angegeben'}
+BESCHREIBUNG: {beschreibung[:3000]}
 
-ZUSÄTZLICHE DATEN (aus Scraping):
-{zusatz_text}
+# Erlaubte Felder (Whitelist – verbindlich)
+Es dürfen ausschließlich die folgenden Felder verwendet werden. Jedes andere Feld ist strikt verboten.
 
-BESCHREIBUNG:
-{beschreibung[:3000]}
+Objekttyp
+Baujahr
+Wohnfläche
+Grundstück
+Zimmer
+Preis
+Standort
+Energieeffizienz
+Besonderheiten
 
-Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
+# Ausgabeformat (verbindlich)
+Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
 
-Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
-Zimmer: [Anzahl oder "-"]
-Schlafzimmer: [Anzahl oder "-"]
-Wohnfläche: [X m² oder "-"]
-Grundstück: [X m² oder "-"]
-Baujahr: [Jahr oder "-"]
-Kategorie: [Kaufen/Mieten]
-Preis: [Preis in € oder "-"]
-Standort: [PLZ Ort oder "-"]
-Energieeffizienz: [Klasse A+ bis H oder "-"]
-Besonderheiten: [Kommaseparierte Liste oder "-"]
+Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
+Baujahr: [Jahr]
+Wohnfläche: [Zahl in m²]
+Grundstück: [Zahl in m²]
+Zimmer: [Anzahl]
+Preis: [Zahl in €]
+Standort: [Ort oder PLZ Ort]
+Energieeffizienz: [Klasse]
+Besonderheiten: [kommaseparierte Liste]
 
-WICHTIG: 
-- ALLE 11 Felder MÜSSEN in der Ausgabe sein
-- Nutze "-" für unbekannte/fehlende Werte
-- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
-- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
-- Preis im Format "XXX.XXX €" """
+# Strikte Regeln (bindend)
+• Es ist strengstens untersagt, eigene Felder zu erfinden.
+• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" oder ähnliche sind ausnahmslos verboten.
+• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
+• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
+• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
+• Es darf niemals mehr als ein Feld pro Zeile stehen.
+• Verwende ausschließlich arabische Ziffern.
+• Einheiten exakt wie folgt anhängen:
+  – Wohnfläche und Grundstück: m²
+  – Preis: €
+• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
+• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
+
+# Ziel
+Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken). Jede Abweichung vom Format gilt als Fehler."""
 
     try:
         headers = {
@@ -441,11 +502,11 @@ WICHTIG:
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
+                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen."},
                 {"role": "user", "content": prompt}
             ],
-            "max_tokens": 500,
-            "temperature": 0.1
+            "max_tokens": 400,
+            "temperature": 0.0  # Deterministisch
         }
         
         response = requests.post(
@@ -459,15 +520,14 @@ WICHTIG:
         result = response.json()
         gpt_output = result["choices"][0]["message"]["content"].strip()
         
-        # Normalisiere und fülle fehlende Felder
+        # Normalisiere
         kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
         
-        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
+        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
         return kurzbeschreibung
         
     except Exception as e:
         print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
-        # Fallback: Erstelle aus Scrape-Daten
         return normalize_kurzbeschreibung("", scraped_data)
 
 # ===========================================================================
@@ -476,129 +536,72 @@ WICHTIG:
 
 def extract_price(page_text: str) -> str:
     """Extrahiere Preis aus dem Seitentext"""
-    print(f"[DEBUG] extract_price called, text length: {len(page_text)}")
-    
     # Suche nach verschiedenen Preis-Patterns
     patterns = [
-        # Mit Komma am Ende: "2.700.000,- €" oder "184.500,- €"
-        # Flexibel für: des/der Eigentümers/Eigentümerin
         r"Kaufpreis(?:vorstellung)?[:\s]+(?:de[rs]\s+)?(?:Eigentümer(?:s|in)?[:\s]+)?€?\s*([\d.]+),?-?\s*€",
-        # Standard ohne Komma: "Kaufpreis: 459.500 €"
         r"Kaufpreis(?:vorstellung)?[:\s]+(?:de[rs]\s+)?(?:Eigentümer(?:s|in)?[:\s]+)?€?\s*([\d.]+(?:,\d+)?)\s*€",
-        # Kaltmiete
         r"[-•]?\s*Kaltmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        # Warmmiete
         r"[-•]?\s*Warmmiete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        # Generische Miete
         r"[-•]?\s*Miete[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
-        # Generischer Preis
         r"[-•]?\s*Preis[:\s]+€?\s*([\d.]+(?:,\d+)?)\s*€",
     ]
     
-    # Suche nach "Kaufpreis" im Text
-    if "aufpreis" in page_text.lower():
-        idx = page_text.lower().find("aufpreis")
-        context = page_text[max(0, idx-20):min(len(page_text), idx+100)]
-        print(f"[DEBUG] Found 'aufpreis' in text: ...{context}...")
-    
-    for i, pattern in enumerate(patterns, 1):
+    for pattern in patterns:
         m = re.search(pattern, page_text, re.IGNORECASE)
         if m:
             preis_str = m.group(1)
-            print(f"[DEBUG] Pattern {i} matched! Extracted: {preis_str}")
+            preis_clean = preis_str.replace(".", "")
             
-            # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
-            # Aber nur wenn es nicht ",00" oder ähnlich ist
-            preis_clean = preis_str.replace(".", "")  # Entferne Tausenderpunkte
-            
-            # Wenn Komma vorhanden, ersetze durch Punkt (für Dezimalstellen)
             if "," in preis_clean:
                 preis_clean = preis_clean.replace(",", ".")
             
-            print(f"[DEBUG] Cleaned: {preis_clean}")
-            
             try:
                 preis_num = float(preis_clean)
-                if preis_num > 100:  # Plausibilitätsprüfung
+                if preis_num > 100:
                     result = f"€{int(preis_num):,}".replace(",", ".")
-                    print(f"[DEBUG] Formatted price: {result}")
                     return result
-                else:
-                    print(f"[DEBUG] Price too small ({preis_num}), continuing...")
-            except Exception as e:
-                print(f"[DEBUG] Error converting price: {e}")
+            except:
                 continue
     
-    print("[DEBUG] No price found!")
     return ""
 
 def parse_price_to_number(preis_str: str) -> Optional[float]:
     """Konvertiere Preis-String zu Nummer für Airtable"""
-    print(f"[DEBUG] parse_price_to_number - Input: '{preis_str}'")
     if not preis_str:
-        print(f"[DEBUG] parse_price_to_number - Empty input, returning None")
         return None
     
-    # Entferne Euro-Symbol und Whitespace
     clean = preis_str.replace("€", "").strip()
-    
-    # Deutsche Zahlenformate: 459.500 € oder 1.250,50 €
-    # Entferne Punkte (Tausendertrennzeichen) und ersetze Komma durch Punkt
     clean = clean.replace(".", "").replace(",", ".")
-    print(f"[DEBUG] parse_price_to_number - Cleaned: '{clean}'")
     
     try:
-        result = float(clean)
-        print(f"[DEBUG] parse_price_to_number - Result: {result}")
-        return result
-    except Exception as e:
-        print(f"[DEBUG] parse_price_to_number - Error: {e}")
+        return float(clean)
+    except:
         return None
 
 def extract_plz_ort(text: str, title: str = "") -> str:
     """Extrahiere PLZ und Ort aus Text"""
-    # Zuerst im kompletten Text suchen
     matches = list(RE_PLZ_ORT.finditer(text))
     
     if matches:
-        # Nehme erste PLZ + Ort Kombination
         m = matches[0]
         plz = m.group(1)
         ort = m.group(2).strip()
-        
-        # Bereinige Ort - entferne häufige Zusätze
-        # Pattern: alles nach " - " oder " / " oder ähnlichen Trennern
         ort = re.split(r'\s*[-–/]\s*', ort)[0].strip()
-        
-        # Entferne explizit "angeboten von..." Zusätze
         ort = re.sub(r'\s+(angeboten|von|der|die|das|GmbH|Immobilien).*$', '', ort, flags=re.IGNORECASE).strip()
-        
-        # Entferne Sonderzeichen und extra Whitespace
         ort = re.sub(r"\s+", " ", ort).strip()
         
-        # Falls Ort immer noch Zusätze hat, nimm nur den ersten Teil
         if len(ort.split()) > 2:
-            # Mehr als 2 Wörter -> wahrscheinlich Zusatztext
             ort = " ".join(ort.split()[:2])
         
         return f"{plz} {ort}"
-    
-    # Fallback: Suche nach Ortsnamen ohne PLZ im Titel
-    ort_pattern = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ][a-zäöüß\-]+)?)\b")
-    for m in ort_pattern.finditer(title + " " + text[:500]):
-        ort = m.group(1).strip()
-        if len(ort) > 3 and ort not in ["Haus", "Wohnung", "Grundstück", "Varel", "Das", "Die", "Der"]:
-            return ort
     
     return ""
 
 def extract_objektnummer(url: str) -> str:
     """Extrahiere Objektnummer aus URL"""
-    # URL format: /kaufangebote/efh-in-varel-obenstrohe/
     parts = url.rstrip("/").split("/")
     if len(parts) > 0:
         slug = parts[-1]
-        # Verwende den Slug als eindeutige ID
         return slug
     return ""
 
@@ -667,25 +670,21 @@ def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
     """Extrahiere strukturierte Beschreibung"""
     lines = []
     
-    # Titel als erste Zeile
     if title:
         lines.append(f"=== {title.upper()} ===")
     
-    # Suche nach "Die Eckdaten:" Sektion
     eckdaten_match = re.search(r"Die Eckdaten:\s*(.+?)(?=\n[A-Z][a-z]+:|$)", page_text, re.DOTALL | re.IGNORECASE)
     if eckdaten_match:
         eckdaten_text = eckdaten_match.group(1).strip()
-        # Splitte in Zeilen und bereinige
         eckdaten_lines = [line.strip() for line in eckdaten_text.split("\n") if line.strip()]
         eckdaten_lines = [line.lstrip("-•").strip() for line in eckdaten_lines]
         eckdaten_lines = [line for line in eckdaten_lines if len(line) > 10]
         
         if eckdaten_lines:
             lines.append("\n=== ECKDATEN ===")
-            for line in eckdaten_lines[:20]:  # Max 20 Zeilen
+            for line in eckdaten_lines[:20]:
                 lines.append(f"• {line}")
     
-    # Weitere Abschnitte
     sections = [
         ("Energieausweis", r"Der Energieausweis:\s*(.+?)(?=\n[A-Z][a-z]+:|$)"),
         ("Objektbeschreibung", r"(?:Objektbeschreibung|Beschreibung):\s*(.+?)(?=\n[A-Z][a-z]+:|$)"),
@@ -703,13 +702,11 @@ def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
                 lines.append(f"\n=== {section_name.upper()} ===")
                 lines.extend(section_lines[:15])
     
-    # Bereinige finale Zeilen
     cleaned_lines = _clean_desc_lines(lines)
     
     if cleaned_lines:
         return "\n\n".join(cleaned_lines)[:12000]
     
-    # Fallback: Hole alle Paragraphen
     desc_lines = []
     for p in soup.find_all("p"):
         text = _norm(p.get_text(" ", strip=True))
@@ -725,22 +722,15 @@ def extract_description(soup: BeautifulSoup, title: str, page_text: str) -> str:
 
 def extract_kategorie(page_text: str, title: str, url: str) -> str:
     """Bestimme Kategorie (Kaufen/Mieten)"""
-    # Wenn URL /kaufangebote/ enthält, ist es definitiv Kaufen
     if "/kaufangebote/" in url:
         return "Kaufen"
-    
-    # Wenn URL /mietangebote/ enthält, ist es definitiv Mieten
     if "/mietangebote/" in url:
         return "Mieten"
     
-    # Fallback: Textanalyse
     text = (title + " " + page_text).lower()
-    
-    # Prüfe auf explizite Miet-Keywords
     if any(keyword in text for keyword in ["zur miete", "zu vermieten", "mietangebot", "miete monatlich"]):
         return "Mieten"
     
-    # Default: Kaufen
     return "Kaufen"
 
 def extract_objekttyp(page_text: str, title: str) -> str:
@@ -759,7 +749,7 @@ def extract_objekttyp(page_text: str, title: str) -> str:
             if re.search(pattern, text, re.IGNORECASE):
                 return typ
     
-    return "Wohnhaus"  # Default
+    return "Wohnhaus"
 
 # ===========================================================================
 # SCRAPING FUNCTIONS
@@ -769,7 +759,6 @@ def collect_detail_links() -> List[str]:
     """Sammle alle Detailseiten-Links von allen Angebotsseiten"""
     all_links = []
     
-    # URLs die keine echten Immobilien sind
     BLACKLIST = [
         "/finanzierung/",
         "/diskrete-kaufangebote/",
@@ -781,18 +770,13 @@ def collect_detail_links() -> List[str]:
         try:
             soup = soup_get(list_url)
             
-            # Suche nach Links die zu Immobilien-Details führen
-            # Format: /kaufangebote/[slug]/ oder /mietangebote/[slug]/
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 
-                # Prüfe ob es ein Immobilien-Link ist
                 if ("/kaufangebote/" in href or "/mietangebote/" in href) and href.count("/") >= 3:
-                    # Ignoriere die Hauptseiten
                     if href.strip("/") in ["kaufangebote", "mietangebote"]:
                         continue
                     
-                    # Ignoriere Blacklist-URLs
                     if any(blacklisted in href for blacklisted in BLACKLIST):
                         continue
                     
@@ -811,16 +795,13 @@ def parse_detail(detail_url: str) -> dict:
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
     
-    # Titel - oft in H1 oder H2
     title = ""
     for tag in soup.find_all(["h1", "h2"]):
         text = _norm(tag.get_text(strip=True))
-        # Ignoriere generische Titel
         if text and len(text) > 10 and text not in ["Aktuelles Kaufangebot", "Aktuelles Mietangebot"]:
             title = text
             break
     
-    # Fallback 1: Nächstes H2 nach generischem H1
     if not title or title in ["Aktuelles Kaufangebot", "Aktuelles Mietangebot"]:
         h_tags = soup.find_all(["h1", "h2", "h3"])
         for i, tag in enumerate(h_tags):
@@ -831,7 +812,6 @@ def parse_detail(detail_url: str) -> dict:
                     title = next_text
                     break
     
-    # Fallback 2: Suche nach Muster "Wohnhaus in..." im Text
     if not title or len(title) < 10:
         patterns = [
             r"((?:Wohnhaus|Eigentumswohnung|Baugrundstück|Wohnanlage|Apartment|Maisonette-Wohnung)\s+in\s+[A-Z][\w\s/-]+)",
@@ -843,56 +823,29 @@ def parse_detail(detail_url: str) -> dict:
                 title = m.group(1).strip()
                 break
     
-    # Objektnummer aus URL
     objektnummer = extract_objektnummer(detail_url)
-    
-    # Preis
-    print(f"[DEBUG] Extracting price from page_text...")
     preis = extract_price(page_text)
-    print(f"[DEBUG] Extracted price: '{preis}'")
-    
-    # PLZ/Ort
     ort = extract_plz_ort(page_text, title)
     
-    # Bild-URL - erstes größeres Bild (nicht das Logo)
     image_url = ""
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if src and ("/wp-content/uploads/" in src or "go-x" in src):
-            # Ignoriere kleine Icons und Logos
             if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
                 continue
-            
-            # Ignoriere das Standard-Platzhalterbild
             if "2b42354c-5e2d-4fab-acae-4280e6ed4089" in src:
                 continue
-            
-            # Prüfe Bildgröße anhand URL oder alt-Text
             alt = img.get("alt", "").lower()
             if "logo" in alt:
                 continue
-            
             image_url = src if src.startswith("http") else urljoin(BASE, src)
-            print(f"[DEBUG] Found image: {image_url[:80]}...")
             break
     
-    if not image_url:
-        print(f"[DEBUG] No suitable image found for {detail_url}")
-    
-    # Kategorie
     kategorie = extract_kategorie(page_text, title, detail_url)
-    
-    # Objekttyp
     objekttyp = extract_objekttyp(page_text, title)
-    
-    # Beschreibung
     description = extract_description(soup, title, page_text)
-    
-    # Zusätzliche Daten extrahieren
     additional_data = extract_additional_data(page_text)
     
-    # Kurzbeschreibung via GPT generieren (mit allen verfügbaren Scrape-Daten)
-    # OPTIMIERUNG: Cache-Check passiert in der Funktion
     kurzbeschreibung = generate_kurzbeschreibung(
         beschreibung=description,
         titel=title,
@@ -921,36 +874,23 @@ def parse_detail(detail_url: str) -> dict:
 
 def make_record(row: dict) -> dict:
     """Erstelle Airtable-Record"""
-    print(f"[DEBUG] make_record - Input Preis: '{row.get('Preis', 'NOT FOUND')}'")
-    
-    # Konvertiere Preis zu Number für Airtable
     preis_value = parse_price_to_number(row["Preis"])
-    print(f"[DEBUG] make_record - Converted Preis: {preis_value} (type: {type(preis_value)})")
     
-    # Wichtig: Wenn preis_value None ist, nicht ins Record aufnehmen
-    # Sonst versucht Airtable ein None-Feld zu setzen
     record = {
         "Titel": row["Titel"],
         "Kategorie": row["Kategorie"],
         "Webseite": row["URL"],
         "Objektnummer": row["Objektnummer"],
-        # "Objekttyp": row["Objekttyp"],  # Auskommentiert - Feld existiert nicht in Airtable
         "Beschreibung": row["Beschreibung"],
         "Bild": row["Bild_URL"],
         "Standort": row["Ort"],
     }
     
-    # Kurzbeschreibung hinzufügen wenn vorhanden
     if row.get("Kurzbeschreibung"):
         record["Kurzbeschreibung"] = row["Kurzbeschreibung"]
-        print(f"[DEBUG] make_record - Added Kurzbeschreibung ({len(row['Kurzbeschreibung'])} chars)")
     
-    # Nur Preis hinzufügen wenn vorhanden
     if preis_value is not None:
         record["Preis"] = preis_value
-        print(f"[DEBUG] make_record - Added Preis to record: {preis_value}")
-    else:
-        print(f"[DEBUG] make_record - WARNING: Preis is None, not adding to record")
     
     return record
 
@@ -989,10 +929,8 @@ def run():
         try:
             print(f"\n[SCRAPE] {i}/{len(detail_links)} | {url}")
             row = parse_detail(url)
-            print(f"[DEBUG] Parsed row - Preis: '{row.get('Preis', 'NOT FOUND')}'")
             record = make_record(row)
             
-            # Zeige Vorschau
             preis_display = record.get('Preis', 'N/A')
             print(f"  → {record['Kategorie']:8} | {record['Titel'][:60]} | {record.get('Standort', 'N/A')} | Preis: {preis_display}")
             
@@ -1005,6 +943,14 @@ def run():
     
     if not all_rows:
         print("[WARN] Keine Datensätze gefunden.")
+        return
+    
+    # NEUE VALIDIERUNG: Leere Records filtern
+    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records auf Gültigkeit...")
+    all_rows = filter_valid_records(all_rows)
+    
+    if not all_rows:
+        print("[WARN] Keine gültigen Datensätze nach Filterung.")
         return
     
     # Speichere CSV
@@ -1030,15 +976,12 @@ def run():
         
         desired = {}
         for r in all_rows:
-            print(f"[DEBUG] Processing record for Airtable: Titel={r.get('Titel', 'N/A')[:30]}, Preis={r.get('Preis', 'N/A')}")
             k = unique_key(r)
             if k in desired:
                 if len(r.get("Beschreibung", "")) > len(desired[k].get("Beschreibung", "")):
                     desired[k] = sanitize_record_for_airtable(r, allowed)
             else:
-                sanitized = sanitize_record_for_airtable(r, allowed)
-                print(f"[DEBUG] After sanitization, Preis={sanitized.get('Preis', 'MISSING')}")
-                desired[k] = sanitized
+                desired[k] = sanitize_record_for_airtable(r, allowed)
         
         to_create, to_update, keep = [], [], set()
         for k, fields in desired.items():
@@ -1064,6 +1007,9 @@ def run():
         if to_delete_ids:
             print(f"[Airtable] Lösche {len(to_delete_ids)} Records...")
             airtable_batch_delete(to_delete_ids)
+        
+        # NEUER CLEANUP: Lösche leere Records aus Airtable
+        cleanup_empty_airtable_records()
         
         print("[Airtable] Synchronisation abgeschlossen.\n")
     else:
